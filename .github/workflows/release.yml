@@ -3,40 +3,40 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 jobs:
   build-release:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y cmake gcc g++
-    
-    - name: Configure CMake
-      run: cmake -B build -DCMAKE_BUILD_TYPE=Release
-    
-    - name: Build
-      run: cmake --build build --config Release
-    
-    - name: Test
-      run: |
-        cd build
-        ctest -V
-        
-    - name: Create Archive
-      run: |
-        mkdir -p release-artifacts
-        cd build
-        tar -czvf ../release-artifacts/meridian-${{ github.ref_name }}.tar.gz bin/
-        
-    - name: Create Release
-      uses: softprops/action-gh-release@v2
-      with:
-        files: release-artifacts/*
-        draft: false
-        prerelease: false
-        generate_release_notes: true
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake gcc g++ libsodium-dev libcodec2-dev
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: |
+          cd build
+          ctest -V
+
+      - name: Create Archive
+        run: |
+          mkdir -p release-artifacts
+          cd build
+          tar -czvf ../release-artifacts/meridian-${{ github.ref_name }}.tar.gz bin/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-artifacts/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true

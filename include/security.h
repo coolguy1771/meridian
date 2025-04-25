@@ -7,7 +7,14 @@
 /**
  * @file security.h
  * @brief Cryptographic functionality for secure communications
+ * 
+ * This module implements secure cryptographic operations for the radio
+ * mesh network. It relies on libsodium for strong, audited cryptographic
+ * primitives.
  */
+
+/* libsodium is required */
+#include <sodium.h>
 
 /* Encryption types */
 #define CIPHER_AES_GCM         0    /* AES-256 in GCM mode (hardware accelerated) */
