@@ -34,7 +34,7 @@ jobs:
           tar -czvf ../release-artifacts/meridian-${{ github.ref_name }}.tar.gz bin/
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: release-artifacts/*
           draft: false
