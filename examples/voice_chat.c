@@ -11,6 +11,12 @@
 #define OUR_NODE_ID   0x1001
 #define PEER_NODE_ID  0x1002
 
+/**
+ * Demonstrates an encrypted voice packet exchange between two simulated nodes.
+ *
+ * @return 0 if the demonstration completes successfully, or 1 if initialization,
+ *         handshake, session-key, packet, serialization, or decryption processing fails.
+ */
 int main(void) {
     printf("Meridian Voice Chat Demo (Codec2 stub + security)\n");
 

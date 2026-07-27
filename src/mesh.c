@@ -23,6 +23,11 @@
    On real hardware this is loaded from configuration/flash; here we keep a configurable default for demo/testing. */
 #define MESH_NETWORK_PSK "MERIDIAN_DEFAULT_PSK_V1" /* Replace with actual provisioned key per deployment */
 
+/**
+ * Derives the network encryption key from the configured pre-shared key.
+ *
+ * @param out Buffer that receives the derived network key.
+ */
 static void derive_network_key_from_psk(uint8_t out[SYMMETRIC_KEY_LENGTH]) {
     crypto_generichash(out, SYMMETRIC_KEY_LENGTH, (uint8_t*)MESH_NETWORK_PSK, strlen(MESH_NETWORK_PSK), NULL, 0);
 }
@@ -60,9 +65,12 @@ static int mesh_find_route_index(uint16_t dest_id);
 static int mesh_add_neighbor(uint16_t node_id, uint8_t band, int16_t rssi);
 static int mesh_find_neighbor_index(uint16_t node_id);
 
-/* ============================================================================
- * Initialization
- * ============================================================================ */
+/**
+ * Initializes the mesh state, radio, network key, and initial beacon transmission.
+ *
+ * @param our_node_id Identifier assigned to this node.
+ * @return 0 on success, or -1 if radio initialization fails.
+ */
 
 int mesh_init(uint16_t our_node_id) {
     memset(&mesh_state, 0, sizeof(mesh_state));
@@ -96,15 +104,27 @@ int mesh_init(uint16_t our_node_id) {
     return 0;
 }
 
+/**
+ * Sets the callback for application-level packets after decryption and core processing.
+ *
+ * @param callback Function invoked with each processed application-level packet.
+ * @return 0 on success.
+ */
 int mesh_set_rx_callback(void (*callback)(const packet_t* packet, int16_t rssi, int8_t snr)) {
     /* Store callback for application-level packets after decryption and core processing. */
     mesh_state.app_rx_callback = callback;
     return 0;
 }
 
-/* ============================================================================
- * Receive path: decrypt + process by type (beacon/handshake/data)
- * ============================================================================ */
+/**
+ * Processes a decrypted packet, updating routing state and dispatching it by type.
+ *
+ * @param packet Decrypted packet to process.
+ * @param from_node Relay node that forwarded the packet, or 0 for a direct link.
+ * @param rssi Received signal strength indication.
+ * @param snr Received signal-to-noise ratio.
+ * @return 0 on success, or -1 if packet is null or contains an incomplete handshake payload.
+ */
 
 int mesh_process_packet(const packet_t* packet, uint16_t from_node, int16_t rssi, int8_t snr) {
     if (!packet) return -1;
@@ -200,9 +220,12 @@ int mesh_process_packet(const packet_t* packet, uint16_t from_node, int16_t rssi
     return 0;
 }
 
-/* ============================================================================
- * Transmit path: per-destination session key lookup + encryption
- * ============================================================================ */
+/**
+ * Encrypts and transmits a packet using the appropriate network or session key.
+ *
+ * @param packet Packet to encrypt and transmit.
+ * @returns The transmission result, or `-1` if `packet` is null, or `-3` if a session key cannot be established.
+ */
 
 int mesh_send_packet(packet_t* packet) {
     if (!packet) return -1;
@@ -261,6 +284,14 @@ int mesh_send_packet(packet_t* packet) {
     return mesh_send_packet_internal(packet, session_key_buf);
 }
 
+/**
+ * Encrypts, serializes, and transmits a packet.
+ *
+ * @param packet Packet to transmit.
+ * @param key Encryption key.
+ * @return `0` or a radio transmission result on success, `-1` if encryption
+ *         fails, or `-2` if serialization fails.
+ */
 static int mesh_send_packet_internal(packet_t* packet, const uint8_t* key) {
     if (packet_encrypt(packet, key) != 0) {
         return -1;
@@ -273,9 +304,13 @@ static int mesh_send_packet_internal(packet_t* packet, const uint8_t* key) {
     return radio_transmit(buf, (size_t)len, 2000);
 }
 
-/* ============================================================================
- * Routing and neighbor management
- * ============================================================================ */
+/**
+ * Finds the next hop and radio band for reaching a destination node.
+ *
+ * @param dest_id Destination node identifier.
+ * @param best_band Output pointer receiving the selected radio band.
+ * @return The next-hop node identifier, or 0 if no route is available.
+ */
 
 uint16_t mesh_find_next_hop(uint16_t dest_id, uint8_t* best_band) {
     if (dest_id == 0 || dest_id == mesh_state.our_node_id) {
@@ -307,6 +342,15 @@ uint16_t mesh_find_next_hop(uint16_t dest_id, uint8_t* best_band) {
     return 0; /* No route */
 }
 
+/**
+ * Updates neighbor and route information for a node observed directly or through a relay.
+ *
+ * @param source Node whose route information is being updated.
+ * @param from_node Relay node through which the source was observed, or 0 for a direct link.
+ * @param rssi Received signal strength for the observation.
+ * @param band Radio band used for the observation.
+ * @returns 0 on success, or -1 if source is zero or identifies this node.
+ */
 int mesh_update_routing(uint16_t source, uint16_t from_node, int16_t rssi, uint8_t band) {
     if (source == 0 || source == mesh_state.our_node_id) return -1;
 
@@ -333,6 +377,11 @@ int mesh_update_routing(uint16_t source, uint16_t from_node, int16_t rssi, uint8
     return 0;
 }
 
+/**
+ * Broadcasts discovery beacons and returns the number of active neighbors found.
+ *
+ * @return The number of active neighbors.
+ */
 int mesh_discover(void) {
     mesh_state.discovery_mode = 1;
 
@@ -359,6 +408,15 @@ int mesh_discover(void) {
     return mesh_count_neighbors();
 }
 
+/**
+ * Broadcasts a packet to all nodes using the network key.
+ *
+ * @param type Packet type.
+ * @param payload Data to broadcast.
+ * @param payload_len Length of the payload in bytes.
+ * @param ttl Maximum number of hops.
+ * @return Transmission result; -1 if the payload is invalid, or -2 if packet creation fails.
+ */
 int mesh_broadcast(uint8_t type, const uint8_t* payload, size_t payload_len, uint8_t ttl) {
     if (!payload || payload_len > MAX_PAYLOAD_SIZE) return -1;
 
@@ -374,6 +432,12 @@ int mesh_broadcast(uint8_t type, const uint8_t* payload, size_t payload_len, uin
     return mesh_send_packet_internal(&pkt, mesh_state.network_key);
 }
 
+/**
+ * Retrieves the recorded information for a neighboring node.
+ * @param node_id Identifier of the neighbor to retrieve.
+ * @param neighbor Destination for the neighbor information.
+ * @return 0 if the neighbor is found, 1 if it is not found, or -1 if neighbor is null.
+ */
 int mesh_get_neighbor(uint16_t node_id, neighbor_t* neighbor) {
     if (!neighbor) return -1;
     int idx = mesh_find_neighbor_index(node_id);
@@ -382,10 +446,23 @@ int mesh_get_neighbor(uint16_t node_id, neighbor_t* neighbor) {
     return 0;
 }
 
+/**
+ * Updates a neighbor's signal information for the specified band.
+ *
+ * @param node_id Neighbor node identifier.
+ * @param band Radio band used to reach the neighbor.
+ * @param rssi Received signal strength indicator.
+ * @return 0 on success, or -1 if the node identifier is invalid.
+ */
 int mesh_update_neighbor(uint16_t node_id, uint8_t band, int16_t rssi) {
     return mesh_add_neighbor(node_id, band, rssi);
 }
 
+/**
+ * Counts neighbors that have been seen within the neighbor timeout period.
+ *
+ * @return The number of active neighbors.
+ */
 int mesh_count_neighbors(void) {
     int count = 0;
     uint32_t now = platform_get_time_ms();
@@ -398,6 +475,11 @@ int mesh_count_neighbors(void) {
     return count;
 }
 
+/**
+ * Removes routes that have exceeded the route timeout.
+ *
+ * @return The number of routes removed.
+ */
 int mesh_prune_routes(void) {
     int pruned = 0;
     uint32_t now = platform_get_time_ms();
@@ -411,6 +493,11 @@ int mesh_prune_routes(void) {
     return pruned;
 }
 
+/**
+ * Sends a broadcast beacon announcing this node's supported bands and battery level.
+ *
+ * @return 0 or a radio transmission status on success, -1 if the beacon packet cannot be created.
+ */
 int mesh_send_beacon(void) {
     uint8_t payload[] = {0x07, 100}; /* bands mask, battery level */
 
@@ -424,9 +511,16 @@ int mesh_send_beacon(void) {
     return mesh_send_packet_internal(&pkt, mesh_state.network_key);
 }
 
-/* ============================================================================
- * Internal helpers
- * ============================================================================ */
+/**
+ * Adds or updates a route entry for a destination node.
+ *
+ * @param dest_id Destination node identifier.
+ * @param next_hop Next node used to reach the destination.
+ * @param hops Number of hops to the destination.
+ * @param rssi Link signal strength for the route.
+ * @param band Radio band used by the route.
+ * @return Always 0.
+ */
 
 static int mesh_add_route(uint16_t dest_id, uint16_t next_hop, uint8_t hops,
                           int8_t rssi, uint8_t band) {
@@ -453,6 +547,11 @@ static int mesh_add_route(uint16_t dest_id, uint16_t next_hop, uint8_t hops,
     return 0;
 }
 
+/**
+ * Finds the route-table entry for a destination node.
+ * @param dest_id Destination node identifier.
+ * @return The matching route-table index, or -1 if no entry exists.
+ */
 static int mesh_find_route_index(uint16_t dest_id) {
     for (int i = 0; i < MAX_ROUTE_ENTRIES; i++) {
         if (mesh_state.routes[i].dest_id == dest_id) {
@@ -462,6 +561,14 @@ static int mesh_find_route_index(uint16_t dest_id) {
     return -1;
 }
 
+/**
+ * Adds or updates a neighbor entry with its signal strength and last-seen time.
+ *
+ * @param node_id Neighbor node identifier.
+ * @param band Band on which the neighbor was observed.
+ * @param rssi Received signal strength indicator.
+ * @return 0 on completion, or -1 if the node identifier is invalid.
+ */
 static int mesh_add_neighbor(uint16_t node_id, uint8_t band, int16_t rssi) {
     if (node_id == 0 || node_id == mesh_state.our_node_id) return -1;
 
@@ -487,6 +594,12 @@ static int mesh_add_neighbor(uint16_t node_id, uint8_t band, int16_t rssi) {
     return 0;
 }
 
+/**
+ * Finds the neighbor table entry for a node.
+ *
+ * @param node_id Node identifier to search for.
+ * @return The neighbor table index, or -1 if the node is not found.
+ */
 static int mesh_find_neighbor_index(uint16_t node_id) {
     for (int i = 0; i < MAX_NEIGHBORS; i++) {
         if (mesh_state.neighbors[i].node_id == node_id) {
@@ -496,9 +609,14 @@ static int mesh_find_neighbor_index(uint16_t node_id) {
     return -1;
 }
 
-/* ============================================================================
- * Radio callback glue
- * ============================================================================ */
+/**
+ * Processes a received radio frame by deserializing, decrypting, and dispatching its packet.
+ *
+ * @param data Received frame data.
+ * @param len Length of the received frame in bytes.
+ * @param rssi Received signal strength.
+ * @param snr Signal-to-noise ratio.
+ */
 
 static void mesh_rx_handler(uint8_t* data, size_t len, int16_t rssi, int8_t snr) {
     packet_t pkt;
@@ -550,13 +668,23 @@ static void mesh_tx_handler(void) {
     /* Post-transmission handling; no-op for now */
 }
 
+/**
+ * Logs a radio error code at warning level.
+ *
+ * @param error Radio error code.
+ */
 static void mesh_error_handler(uint16_t error) {
     platform_log(LOG_LEVEL_WARNING, "Radio error: 0x%04X", error);
 }
 
-/* ============================================================================
- * Group management functions: used by application/CLI to manage groups.
- * ============================================================================ */
+/**
+ * Sends a group-join invitation containing the group's shared key to a member.
+ *
+ * @param leader_id Node ID of the group leader.
+ * @param member_id Node ID of the member receiving the invitation.
+ * @param group_id Identifier of the group to join.
+ * @return `0` or a non-negative transmission result on success; `-1` for invalid identifiers, `-2` if the group key cannot be created, `-3` if no session is established with the member, or `-4` if the invitation packet cannot be created.
+ */
 
 int mesh_send_group_join_invite(uint16_t leader_id, uint16_t member_id, uint16_t group_id) {
     if (member_id == 0 || group_id == 0) {
@@ -622,6 +750,15 @@ int mesh_send_group_join_invite(uint16_t leader_id, uint16_t member_id, uint16_t
     return rc;
 }
 
+/**
+ * Broadcasts a group chat message to all nodes within the mesh.
+ *
+ * @param group_id Group whose shared key encrypts the message.
+ * @param payload Message data to broadcast.
+ * @param len Length of the message data in bytes.
+ * @return `0` or a radio transmission result on success; `-1` for invalid arguments,
+ *         `-2` if the group key is unavailable, or `-3` if packet creation fails.
+ */
 int mesh_broadcast_group_chat(uint16_t group_id, const uint8_t* payload, size_t len) {
     if (!payload || len > MAX_PAYLOAD_SIZE || group_id == 0) {
         return -1;

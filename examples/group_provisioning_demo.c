@@ -24,6 +24,11 @@
 #define MEMBER_B    0x1002
 #define GROUP_ID_1  0x0001
 
+/**
+ * Runs the Meridian group provisioning and encrypted group messaging demonstration.
+ *
+ * @return 0 on successful completion, 1 if initialization or a demonstration step fails.
+ */
 int main(void) {
     printf("=== Meridian Group Provisioning Demo ===\n");
 

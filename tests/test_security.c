@@ -9,6 +9,11 @@
     if (!(cond)) { fprintf(stderr, "[FAIL] %s at line %d\n", msg, __LINE__); return -1; } \
 } while(0)
 
+/**
+ * Initializes the platform and security subsystem.
+ *
+ * @return 0 if initialization succeeds, -1 otherwise.
+ */
 static int test_init(void) {
     printf("Testing security init...");
     if (platform_init() != 0) {
@@ -24,6 +29,11 @@ static int test_init(void) {
     return 0;
 }
 
+/**
+ * Generates a public/private keypair and verifies that the public key is not zeroed.
+ *
+ * @return 0 on success, or -1 if keypair generation fails or the public key appears zeroed.
+ */
 static int test_key_generation(void) {
     printf("Testing key generation...");
 
@@ -41,6 +51,11 @@ static int test_key_generation(void) {
     return 0;
 }
 
+/**
+ * Verifies that two identities derive the same shared secret through ECDH.
+ *
+ * @return 0 if the key exchange succeeds and both shared secrets match, -1 otherwise.
+ */
 static int test_ecdh(void) {
     printf("Testing ECDH key exchange...");
 
@@ -86,6 +101,11 @@ static int test_ecdh(void) {
     return 0;
 }
 
+/**
+ * Verifies deterministic session key derivation and parameter-dependent key separation.
+ *
+ * @return 0 if all derivation checks pass; -1 otherwise.
+ */
 static int test_key_derivation(void) {
     printf("Testing session key derivation...");
 
@@ -108,6 +128,9 @@ static int test_key_derivation(void) {
     return 0;
 }
 
+/**
+ * Verifies authenticated encryption and decryption, including rejection of tampered ciphertext and associated data.
+ */
 static int test_encryption_decryption(void) {
     printf("Testing encrypt/decrypt roundtrip...");
 
@@ -164,6 +187,11 @@ static int test_encryption_decryption(void) {
     return 0;
 }
 
+/**
+ * Verifies that generated nonces are unique and have a non-decreasing monotonic component.
+ *
+ * @return 0 if all nonce checks pass, or -1 if initialization or any check fails.
+ */
 static int test_nonce_generation(void) {
     printf("Testing nonce uniqueness...");
 
@@ -196,6 +224,11 @@ static int test_nonce_generation(void) {
     return 0;
 }
 
+/**
+ * Verifies storing and retrieving session keys for multiple peers, including rejection of an unknown peer.
+ *
+ * @return 0 if session management behaves as expected, or -1 if initialization or any verification fails.
+ */
 static int test_session_management(void) {
     printf("Testing session management...");
 
@@ -230,6 +263,12 @@ static int test_session_management(void) {
     return 0;
 }
 
+/**
+ * Verifies identity key storage and, on real flash platforms, reloading.
+ *
+ * @returns 0 if the identity keys are stored and verified successfully, or -1
+ * if initialization, storage, retrieval, or key comparison fails.
+ */
 static int test_identity_storage(void) {
     printf("Testing identity key generation + store API...");
 
@@ -271,6 +310,11 @@ static int test_identity_storage(void) {
     return 0;
 }
 
+/**
+ * Runs the security subsystem test suite and reports the number of failures.
+ *
+ * @return The number of failed tests, or 1 if libsodium initialization fails.
+ */
 int main(void) {
     if (sodium_init() < 0) {
         fprintf(stderr, "libsodium init failed\n");

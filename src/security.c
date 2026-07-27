@@ -31,9 +31,13 @@ static struct {
 
 } sec_state;
 
-/* ============================================================================
- * Internal helpers
- * ============================================================================ */
+/**
+ * Computes an HMAC-SHA-256 integrity hash for a monotonic counter value.
+ *
+ * @param ctr Counter whose value is authenticated.
+ * @param out_hash Buffer receiving the 32-byte hash.
+ * @return 0 on success.
+ */
 
 static int compute_counter_hmac(const monotonic_counter_t* ctr, uint8_t out_hash[32]) {
     crypto_auth_hmacsha256_state st;
@@ -43,9 +47,13 @@ static int compute_counter_hmac(const monotonic_counter_t* ctr, uint8_t out_hash
     return 0;
 }
 
-/* ============================================================================
- * Initialization
- * ============================================================================ */
+/**
+ * Initializes the security subsystem and loads or creates its persistent cryptographic state.
+ *
+ * @param mode Security operating mode.
+ * @param cipher Required cipher configuration.
+ * @return 0 on success, -1 if initialization fails or the configuration is unsupported.
+ */
 
 int security_init(uint8_t mode, uint8_t cipher) {
     if (sodium_init() < 0) {
@@ -111,6 +119,11 @@ int security_init(uint8_t mode, uint8_t cipher) {
     return 0;
 }
 
+/**
+ * Copies the loaded identity public key to the specified buffer.
+ * @param out_pubkey Buffer that receives the public key.
+ * @return 0 on success, or -1 if the output buffer is null or the identity key is not loaded.
+ */
 int security_get_identity_public_key(uint8_t* out_pubkey) {
     if (!out_pubkey || !sec_state.identity_loaded) {
         return -1;
@@ -119,9 +132,13 @@ int security_get_identity_public_key(uint8_t* out_pubkey) {
     return 0;
 }
 
-/* ============================================================================
- * Key exchange & session key derivation (X25519 ECDH)
- * ============================================================================ */
+/**
+ * Computes a shared secret with a peer using the loaded identity key.
+ *
+ * @param peer_public_key Peer's public key.
+ * @param shared_secret_out Buffer receiving the shared secret.
+ * @return 0 on success; -1 for invalid inputs or an unloaded identity, -2 if key exchange fails, or -3 if the resulting secret is all zeros.
+ */
 
 int security_compute_shared_secret(const uint8_t* peer_public_key, uint8_t* shared_secret_out) {
     if (!peer_public_key || !shared_secret_out || !sec_state.identity_loaded) {
@@ -137,6 +154,15 @@ int security_compute_shared_secret(const uint8_t* peer_public_key, uint8_t* shar
     return 0;
 }
 
+/**
+ * Derives a session key from a shared secret and the two peer identifiers.
+ *
+ * @param shared_secret Shared secret used as the hash input.
+ * @param our_id Local node identifier.
+ * @param peer_id Remote node identifier.
+ * @param session_key_out Buffer receiving the derived session key.
+ * @return 0 on success, or -1 if an input or output pointer is null.
+ */
 int security_derive_session_key(
     const uint8_t* shared_secret, uint16_t our_id, uint16_t peer_id, uint8_t* session_key_out) {
     if (!shared_secret || !session_key_out) {
@@ -154,14 +180,23 @@ int security_derive_session_key(
     return 0;
 }
 
-/* ============================================================================
- * AEAD encrypt/decrypt using XChaCha20-Poly1305 (libsodium)
+/**
+ * Encrypts plaintext using XChaCha20-Poly1305 with a detached authentication tag.
  *
- * We derive a full 24-byte XChaCha20 nonce from our compact 8-byte protocol nonce
- * via XSalsa20, ensuring:
- *   - Extended nonce space that survives even rare counter collisions.
- *   - Full AEAD guarantees on the same key/nonce pair across encrypt and decrypt.
- * ============================================================================ */
+ * The protocol nonce is expanded into the XChaCha20 nonce using the encryption
+ * key and a fixed domain-separation context.
+ *
+ * @param key Encryption key.
+ * @param nonce Protocol nonce used for nonce expansion.
+ * @param plaintext Data to encrypt.
+ * @param plaintext_len Length of plaintext in bytes.
+ * @param aad Additional authenticated data.
+ * @param aad_len Length of additional authenticated data in bytes.
+ * @param ciphertext_out Buffer receiving the ciphertext.
+ * @param tag_out Buffer receiving the detached authentication tag.
+ * @return Plaintext length on success, -1 for invalid arguments, or -2 if
+ *         encryption fails or produces an unexpected tag length.
+ */
 
 int security_encrypt(
     const uint8_t* key,
@@ -219,6 +254,19 @@ int security_encrypt(
     return (int)plaintext_len;
 }
 
+/**
+ * Decrypts and authenticates ciphertext using the supplied key, nonce, and associated data.
+ *
+ * @param key Encryption key.
+ * @param nonce Protocol nonce used to derive the cipher nonce.
+ * @param ciphertext_in Ciphertext to decrypt.
+ * @param ciphertext_len Length of the ciphertext in bytes.
+ * @param aad Additional authenticated data.
+ * @param aad_len Length of the additional authenticated data in bytes.
+ * @param tag_in Authentication tag for the ciphertext.
+ * @param plaintext_out Buffer for the decrypted plaintext.
+ * @return The plaintext length on success, -1 for invalid inputs, or -2 if authentication or decryption fails.
+ */
 int security_decrypt(
     const uint8_t* key,
     const secure_nonce_t* nonce,
@@ -270,9 +318,12 @@ int security_decrypt(
     return (int)ciphertext_len;
 }
 
-/* ============================================================================
- * Nonce generation: monotonic base + randomized low bits
- * ============================================================================ */
+/**
+ * Generates a protocol nonce using the persistent monotonic counter and randomized low bits.
+ *
+ * @param out_nonce Destination for the generated nonce.
+ * @return 0 on success, or -1 if out_nonce is NULL.
+ */
 
 int security_get_next_nonce(secure_nonce_t* out_nonce) {
     if (!out_nonce) {
@@ -298,9 +349,13 @@ int security_get_next_nonce(secure_nonce_t* out_nonce) {
     return 0;
 }
 
-/* ============================================================================
- * Identity key persistence (encrypted + integrity-protected)
- * ============================================================================ */
+/**
+ * Stores the identity public key and encrypted private key in persistent flash storage.
+ *
+ * @param public_key Identity public key to store.
+ * @param private_key Identity private key to encrypt and store.
+ * @return 0 on success, -1 for invalid inputs, or -2 if private-key encryption fails.
+ */
 
 int security_store_identity_keys(const uint8_t* public_key, const uint8_t* private_key) {
     if (!public_key || !private_key) {
@@ -332,6 +387,13 @@ int security_store_identity_keys(const uint8_t* public_key, const uint8_t* priva
     return 0;
 }
 
+/**
+ * Loads the device identity key pair from persistent storage, generating and storing a replacement if no valid key pair is available.
+ *
+ * @param out_public_key Buffer receiving the public identity key.
+ * @param out_private_key Buffer receiving the private identity key.
+ * @return 0 on success, or -1 if either output buffer is NULL.
+ */
 int security_load_identity_keys(uint8_t* out_public_key, uint8_t* out_private_key) {
     if (!out_public_key || !out_private_key) {
         return -1;
@@ -379,9 +441,13 @@ int security_load_identity_keys(uint8_t* out_public_key, uint8_t* out_private_ke
     return 0;
 }
 
-/* ============================================================================
- * Session management: per-peer symmetric keys
- * ============================================================================ */
+/**
+ * Stores or replaces a symmetric session key for a peer.
+ *
+ * @param peer_id Peer identifier associated with the session.
+ * @param session_key Symmetric key to store.
+ * @return 0 on success, or -1 if the peer identifier is zero or the key is NULL.
+ */
 
 int security_set_session(uint16_t peer_id, const uint8_t* session_key) {
     if (!session_key || peer_id == 0) {
@@ -424,6 +490,13 @@ int security_set_session(uint16_t peer_id, const uint8_t* session_key) {
     return 0;
 }
 
+/**
+ * Retrieves an active session key for a peer.
+ *
+ * @param peer_id Identifier of the peer.
+ * @param out_key Buffer that receives the session key.
+ * @return 0 on success, -1 if the peer ID is invalid, the output buffer is null, or no session exists, or -2 if the session has expired.
+ */
 int security_get_session_key(uint16_t peer_id, uint8_t* out_key) {
     if (!out_key || peer_id == 0) {
         return -1;
@@ -444,15 +517,15 @@ int security_get_session_key(uint16_t peer_id, uint8_t* out_key) {
     return -1; /* No session for peer */
 }
 
-/* ============================================================================
- * Handshake protocol: establish pairwise sessions via ephemeral ECDH
+/**
+ * Establishes a pairwise session from a HELLO or RESPONSE handshake message.
  *
- * Simplified v1 flow (no signatures yet, relies on mesh trust model + later auth):
- *   HELLO(initiator_id=I, pub_key=I_eph_pub) -> R
- *   R derives session_key from ECDH(R_id_priv, I_eph_pub), responds:
- *     RESPONSE(initiator_id=I, responder_id=R)
- *   Both sides store session_key for future encrypted packets.
- * ============================================================================ */
+ * @param msg Incoming handshake message.
+ * @param our_node_id Local node identifier.
+ * @param response_out Buffer receiving the handshake response.
+ * @return 0 on success; a negative error code if the message, identity, or
+ *         shared-secret computation is invalid, or if the message is unsupported.
+ */
 
 int security_process_handshake(
     const handshake_message_t* msg, uint16_t our_node_id, handshake_message_t* response_out) {
@@ -519,9 +592,14 @@ int security_process_handshake(
     return -99; /* Unhandled handshake message type */
 }
 
-/* ============================================================================
- * Legacy compatibility wrappers (kept for existing API consumers)
- * ============================================================================ */
+/**
+ * Generates a public/private cryptographic keypair.
+ *
+ * @param key_type Retained for API compatibility and ignored.
+ * @param public_key Buffer receiving the public key.
+ * @param private_key Buffer receiving the private key.
+ * @return 0 on success, or -1 if an output buffer is null.
+ */
 
 int security_generate_keypair(uint8_t key_type, uint8_t* public_key, uint8_t* private_key) {
     if (!public_key || !private_key) return -1;
@@ -530,6 +608,14 @@ int security_generate_keypair(uint8_t key_type, uint8_t* public_key, uint8_t* pr
     return 0;
 }
 
+/**
+ * Derives independent transmission and reception keys from a shared secret.
+ *
+ * @param shared_secret Shared secret used as the derivation input.
+ * @param tx_key Output buffer for the transmission key.
+ * @param rx_key Output buffer for the reception key.
+ * @return 0 on success, or -1 if an input pointer is NULL.
+ */
 int security_derive_keys(const uint8_t* shared_secret, uint8_t* tx_key, uint8_t* rx_key) {
     if (!shared_secret || !tx_key || !rx_key) return -1;
     uint8_t tx_ctx[32] = {0}; memcpy(tx_ctx, "MERIDIAN_TX_KEY_V2", 18);
@@ -539,34 +625,50 @@ int security_derive_keys(const uint8_t* shared_secret, uint8_t* tx_key, uint8_t*
     return 0;
 }
 
+/**
+ * Verifies the integrity of the persisted monotonic counter.
+ *
+ * @return 0 if the counter integrity check succeeds, -1 otherwise.
+ */
 int security_verify_counter_integrity(void) {
     uint8_t check[32];
     compute_counter_hmac(&sec_state.counter_primary, check);
     return (sodium_memcmp(check, sec_state.counter_primary.hash, 32) == 0) ? 0 : -1;
 }
 
+/**
+ * Stores the device identity key pair.
+ *
+ * @param key_type Retained for compatibility and ignored.
+ * @param public_key Public identity key to store.
+ * @param private_key Private identity key to store.
+ * @return The result of storing the identity keys.
+ */
 int security_store_keys(uint8_t key_type, const uint8_t* public_key, const uint8_t* private_key) {
     (void)key_type;
     return security_store_identity_keys(public_key, private_key);
 }
 
+/**
+ * Loads the device's persistent identity key pair.
+ *
+ * @param public_key Buffer receiving the public key.
+ * @param private_key Buffer receiving the private key.
+ * @return 0 on success; -1 if an output buffer is null or loading fails.
+ */
 int security_load_keys(uint8_t key_type, uint8_t* public_key, uint8_t* private_key) {
     (void)key_type;
     return security_load_identity_keys(public_key, private_key);
 }
 
-/* ============================================================================
- * Group key management: leader-based provisioning with encrypted GROUP_JOIN messages.
+/**
+ * Stores or updates a symmetric key for a group managed by the specified leader.
  *
- * High-level model:
- * - A group is identified by a uint16_t group_id.
- * - Exactly one node acts as the "leader" for that group (who manages membership).
- * - Leader holds the shared symmetric key for each group it created.
- * - To join a group, a new member establishes a pairwise session with the leader,
- *   then the leader sends a GROUP_JOIN payload encrypted under that pairwise session:
- *     { group_id, epoch, group_key }
- * - New member stores the key and can now participate in group communications.
- * ============================================================================ */
+ * @param group_id Identifier of the group.
+ * @param key_in Group key to store.
+ * @param leader_id Identifier of the group leader.
+ * @return 0 on success, or -1 if an input is invalid.
+ */
 
 int security_set_group_key(uint16_t group_id, const uint8_t* key_in, uint16_t leader_id) {
     if (!key_in || group_id == 0 || leader_id == 0) {
@@ -612,6 +714,13 @@ int security_set_group_key(uint16_t group_id, const uint8_t* key_in, uint16_t le
     return 0;
 }
 
+/**
+ * Retrieves the symmetric key for an active group membership.
+ *
+ * @param group_id Identifier of the group.
+ * @param out_key Buffer that receives the group key.
+ * @return 0 on success, or -1 if the arguments are invalid or no active membership exists.
+ */
 int security_get_group_key(uint16_t group_id, uint8_t* out_key) {
     if (!out_key || group_id == 0) {
         return -1;
@@ -627,6 +736,14 @@ int security_get_group_key(uint16_t group_id, uint8_t* out_key) {
     return -1; /* Not a member of this group */
 }
 
+/**
+ * Derives a pairwise secret for encrypted group-join payloads.
+ *
+ * @param peer_public_key Peer identity public key used for key agreement.
+ * @param peer_id Peer identifier used to domain-separate the derived secret.
+ * @param shared Buffer receiving the derived pairwise secret.
+ * @return 0 on success, or -1 if an input is invalid or key agreement fails.
+ */
 int security_derive_pairwise_for_peer(
     const uint8_t* peer_public_key,
     uint16_t peer_id,

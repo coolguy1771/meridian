@@ -19,9 +19,12 @@ static struct {
     uint8_t replay_initialized;         /* Whether trackers are initialized */
 } packet_state;
 
-/* ============================================================================
- * Initialization
- * ============================================================================ */
+/**
+ * Initializes packet state for the specified node and restores the transmit sequence from persistent storage when available.
+ *
+ * @param our_node_id Identifier of the local node.
+ * @returns 0 on success.
+ */
 
 int packet_init(uint16_t our_node_id) {
     packet_state.our_node_id = our_node_id;
@@ -41,9 +44,16 @@ int packet_init(uint16_t our_node_id) {
     return 0;
 }
 
-/* ============================================================================
- * Packet creation and serialization
- * ============================================================================ */
+/**
+ * Initializes a packet with destination, source, type, routing, sequence, and payload data.
+ *
+ * @param packet Packet to initialize.
+ * @param dest_id Destination node identifier.
+ * @param type Packet type.
+ * @param payload Payload data to copy into the packet.
+ * @param payload_len Number of payload bytes.
+ * @return 0 on success, or -1 if an argument is invalid or the payload exceeds MAX_PAYLOAD_SIZE.
+ */
 
 int packet_create(packet_t* packet, uint16_t dest_id, uint8_t type,
                   const uint8_t* payload, size_t payload_len) {
@@ -65,6 +75,13 @@ int packet_create(packet_t* packet, uint16_t dest_id, uint8_t type,
     return 0;
 }
 
+/**
+ * Encrypts a packet payload and authenticates its header and resulting ciphertext.
+ *
+ * @param packet Packet whose payload and authentication tag are updated.
+ * @param key Encryption key.
+ * @returns 0 on success; -1 for invalid arguments, -2 if a nonce cannot be obtained, or a negative encryption error code.
+ */
 int packet_encrypt(packet_t* packet, const uint8_t* key) {
     if (!packet || !key) {
         return -1;
@@ -108,6 +125,13 @@ int packet_encrypt(packet_t* packet, const uint8_t* key) {
     return 0;
 }
 
+/**
+ * Decrypts and authenticates a packet payload.
+ *
+ * @param packet Packet containing the encrypted payload, nonce, and authentication tag.
+ * @param key Key used to decrypt and authenticate the payload.
+ * @returns 0 on success, -1 for invalid arguments, or a negative decryption error code.
+ */
 int packet_decrypt(packet_t* packet, const uint8_t* key) {
     if (!packet || !key) {
         return -1;
@@ -138,6 +162,12 @@ int packet_decrypt(packet_t* packet, const uint8_t* key) {
     return 0;
 }
 
+/**
+ * Serializes a packet into a caller-provided buffer.
+ *
+ * @param buffer_size Capacity of the output buffer in bytes.
+ * @return The number of bytes written, -1 for invalid pointers, or -2 when the buffer is too small.
+ */
 int packet_serialize(const packet_t* packet, uint8_t* buffer, size_t buffer_size) {
     if (!packet || !buffer) {
         return -1;
@@ -155,6 +185,16 @@ int packet_serialize(const packet_t* packet, uint8_t* buffer, size_t buffer_size
     return (int)total;
 }
 
+/**
+ * Deserializes a packet from a contiguous buffer.
+ *
+ * @param buffer Serialized packet data.
+ * @param buffer_len Length of the serialized packet data in bytes.
+ * @param packet Packet structure to populate.
+ * @return 0 on success; -1 for invalid arguments or an incomplete header,
+ *         -2 for insufficient data for the header and authentication tag,
+ *         or -3 for an invalid payload length.
+ */
 int packet_deserialize(const uint8_t* buffer, size_t buffer_len, packet_t* packet) {
     if (!buffer || !packet || buffer_len < sizeof(packet_header_t)) {
         return -1;
@@ -179,9 +219,13 @@ int packet_deserialize(const uint8_t* buffer, size_t buffer_len, packet_t* packe
     return 0;
 }
 
-/* ============================================================================
- * Replay protection: sliding window per source node
- * ============================================================================ */
+/**
+ * Finds or creates replay-tracking state for a source node.
+ *
+ * @param source_id Source node identifier.
+ * @param out_idx Receives the tracker index.
+ * @return 0 on success.
+ */
 
 static int find_or_create_replay_tracker(uint16_t source_id, int* out_idx) {
     /* Find existing tracker */
@@ -220,6 +264,13 @@ static int find_or_create_replay_tracker(uint16_t source_id, int* out_idx) {
     return 0;
 }
 
+/**
+ * Determines whether a sequence number has already been accepted for a source.
+ *
+ * @param source Source node identifier.
+ * @param seq Sequence number to evaluate.
+ * @return 1 if the sequence is stale or was previously accepted, 0 otherwise.
+ */
 int packet_is_replay(uint16_t source, uint32_t seq) {
     if (!packet_state.replay_initialized || source == 0) {
         return 0; /* No replay tracking yet */
@@ -265,9 +316,15 @@ int packet_is_replay(uint16_t source, uint32_t seq) {
     return 0; /* New within window */
 }
 
-/* ============================================================================
- * Packet handling: forwarding and deduplication via recent_packets ring
- * ============================================================================ */
+/**
+ * Determines whether a packet should be delivered locally, forwarded, or ignored.
+ *
+ * @param packet Packet to evaluate.
+ * @param from_node Node from which the packet was received.
+ * @returns 0 if the packet is for this node only, 1 if it should be forwarded,
+ *          2 if it should be delivered locally and forwarded, -1 if packet is
+ *          NULL, or -2 if the packet is a duplicate or has expired.
+ */
 
 int packet_handle(const packet_t* packet, uint16_t from_node) {
     if (!packet) {
@@ -300,6 +357,12 @@ int packet_handle(const packet_t* packet, uint16_t from_node) {
     return -2; /* Don't handle (duplicate or TTL expired) */
 }
 
+/**
+ * Determines whether a packet from a source and sequence has been recently seen.
+ * @param source Packet source identifier.
+ * @param sequence Packet sequence number.
+ * @returns `1` if a matching packet is cached, `0` otherwise.
+ */
 int packet_seen_before(uint16_t source, uint32_t sequence) {
     for (int i = 0; i < RECENT_PACKET_CACHE_SIZE; i++) {
         if (packet_state.recent_packets[i].source == source &&
@@ -310,6 +373,14 @@ int packet_seen_before(uint16_t source, uint32_t sequence) {
     return 0;
 }
 
+/**
+ * Adds a packet identifier and forwarding source to the recent-packet cache.
+ *
+ * @param source Packet source node identifier.
+ * @param sequence Packet sequence number.
+ * @param from_node Node from which the packet was received.
+ * @return 0 on success.
+ */
 int packet_add_to_cache(uint16_t source, uint32_t sequence, uint16_t from_node) {
     recent_packet_t* entry = &packet_state.recent_packets[packet_state.recent_head];
     entry->source = source;
