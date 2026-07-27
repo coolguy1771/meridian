@@ -18,6 +18,15 @@
 #define PACKET_TYPE_CONTROL       0x05  /* Network control message */
 #define PACKET_TYPE_TEXT          0x06  /* Text message */
 #define PACKET_TYPE_POSITION      0x07  /* Position data */
+#define PACKET_TYPE_GROUP_JOIN    0x10  /* Group join invitation from leader to member */
+#define PACKET_TYPE_GROUP_CHAT    0x11  /* Encrypted group chat packet (uses group PSK) */
+
+/* GROUP_JOIN payload structure sent by leader to new member, encrypted under their pairwise session key. */
+typedef struct __attribute__((packed)) {
+    uint16_t group_id;          /* Group the node is being added to */
+    uint32_t epoch;             /* Key rotation epoch counter for future revocations */
+    uint8_t  group_key[SYMMETRIC_KEY_LENGTH];  /* Shared symmetric key for group comms */
+} group_join_payload_t;
 
 /* Maximum values */
 #define MAX_PACKET_SIZE           255   /* Max complete packet size */

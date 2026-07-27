@@ -25,6 +25,10 @@ static struct {
 
     /* Per-peer session table */
     session_info_t sessions[MAX_ACTIVE_SESSIONS];
+
+    /* Group keys: one per joined group */
+    group_key_info_t groups[MAX_GROUP_KEYS];
+
 } sec_state;
 
 /* ============================================================================
@@ -166,15 +170,25 @@ int security_encrypt(
         return -1;
     }
 
-    /* Derive 24-byte XChaCha20 nonce from our 8-byte protocol nonce + key */
+    /* Derive a full 24-byte XChaCha20 nonce deterministically from our 8-byte protocol nonce.
+     * Structure: [hash(nonce_value || context, key)[..15] | nonce_value (8 bytes)] */
     uint8_t xnonce[24];
-    crypto_stream_xsalsa20(xnonce, sizeof(xnonce), (const uint8_t*)&nonce->value, key);
+    {
+        uint8_t ctx_input[16];
+        size_t off = 0;
+        memcpy(ctx_input + off, &nonce->value, sizeof(nonce->value));          off += sizeof(nonce->value);
+        memcpy(ctx_input + off, "MERIDIAN_XNONCE_V1", sizeof("MERIDIAN_XNONCE_V1") - 1);
+
+        uint8_t h[32];
+        crypto_generichash(h, sizeof(h), ctx_input, sizeof(ctx_input), key, SYMMETRIC_KEY_LENGTH);
+        memcpy(xnonce, h, 16);              /* bytes 0..15 */
+        memcpy(xnonce + 16, &nonce->value, sizeof(nonce->value));  /* bytes 16..23 = protocol nonce */
+        sodium_memzero(h, sizeof(h));
+    }
 
     unsigned long long mac_len;
     int r = crypto_aead_xchacha20poly1305_ietf_encrypt_detached(
-                ciphertext_out, /* c_out */
-                tag_out,        /* mac_out */
-                &mac_len,       /* maclen_p */
+                ciphertext_out, tag_out, &mac_len,
                 plaintext, plaintext_len,
                 aad, aad_len,
                 NULL, xnonce, key);
@@ -201,8 +215,20 @@ int security_decrypt(
         return -1;
     }
 
+    /* Derive xnonce the exact same way as security_encrypt */
     uint8_t xnonce[24];
-    crypto_stream_xsalsa20(xnonce, sizeof(xnonce), (const uint8_t*)&nonce->value, key);
+    {
+        uint8_t ctx_input[16];
+        size_t off = 0;
+        memcpy(ctx_input + off, &nonce->value, sizeof(nonce->value));          off += sizeof(nonce->value);
+        memcpy(ctx_input + off, "MERIDIAN_XNONCE_V1", sizeof("MERIDIAN_XNONCE_V1") - 1);
+
+        uint8_t h[32];
+        crypto_generichash(h, sizeof(h), ctx_input, sizeof(ctx_input), key, SYMMETRIC_KEY_LENGTH);
+        memcpy(xnonce, h, 16);              /* bytes 0..15 */
+        memcpy(xnonce + 16, &nonce->value, sizeof(nonce->value));  /* bytes 16..23 = protocol nonce */
+        sodium_memzero(h, sizeof(h));
+    }
 
     int r = crypto_aead_xchacha20poly1305_ietf_decrypt_detached(
                 plaintext_out, NULL,
@@ -488,4 +514,103 @@ int security_store_keys(uint8_t key_type, const uint8_t* public_key, const uint8
 int security_load_keys(uint8_t key_type, uint8_t* public_key, uint8_t* private_key) {
     (void)key_type;
     return security_load_identity_keys(public_key, private_key);
+}
+
+/* ============================================================================
+ * Group key management: leader-based provisioning with encrypted GROUP_JOIN messages.
+ *
+ * High-level model:
+ * - A group is identified by a uint16_t group_id.
+ * - Exactly one node acts as the "leader" for that group (who manages membership).
+ * - Leader holds the shared symmetric key for each group it created.
+ * - To join a group, a new member establishes a pairwise session with the leader,
+ *   then the leader sends a GROUP_JOIN payload encrypted under that pairwise session:
+ *     { group_id, epoch, group_key }
+ * - New member stores the key and can now participate in group communications.
+ * ============================================================================ */
+
+int security_set_group_key(uint16_t group_id, const uint8_t* key_in, uint16_t leader_id) {
+    if (!key_in || group_id == 0 || leader_id == 0) {
+        return -1;
+    }
+
+    /* Find existing slot or allocate one */
+    int idx = -1;
+    for (int i = 0; i < MAX_GROUP_KEYS; i++) {
+        if (sec_state.groups[i].group_id == group_id) {
+            idx = i;
+            break;
+        }
+    }
+
+    if (idx < 0) {
+        /* Find an empty slot */
+        for (int i = 0; i < MAX_GROUP_KEYS; i++) {
+            if (!sec_state.groups[i].active) {
+                idx = i;
+                break;
+            }
+        }
+    }
+
+    if (idx < 0) {
+        /* Group table full: evict oldest (highest epoch tiebreak not used for simplicity) */
+        uint32_t oldest_epoch = sec_state.groups[0].epoch + 1;
+        for (int i = 1; i < MAX_GROUP_KEYS; i++) {
+            if (!sec_state.groups[i].active || sec_state.groups[i].epoch < oldest_epoch) {
+                oldest_epoch = sec_state.groups[i].epoch;
+                idx = i;
+            }
+        }
+    }
+
+    memcpy(sec_state.groups[idx].group_key, key_in, SYMMETRIC_KEY_LENGTH);
+    sec_state.groups[idx].group_id  = group_id;
+    sec_state.groups[idx].leader_id = (uint8_t)(leader_id & 0xFF); /* For v1, low byte is fine */
+    sec_state.groups[idx].epoch     = (sec_state.groups[idx].active ? sec_state.groups[idx].epoch + 1 : 1);
+    sec_state.groups[idx].active    = 1;
+
+    return 0;
+}
+
+int security_get_group_key(uint16_t group_id, uint8_t* out_key) {
+    if (!out_key || group_id == 0) {
+        return -1;
+    }
+
+    for (int i = 0; i < MAX_GROUP_KEYS; i++) {
+        if (sec_state.groups[i].active && sec_state.groups[i].group_id == group_id) {
+            memcpy(out_key, sec_state.groups[i].group_key, SYMMETRIC_KEY_LENGTH);
+            return 0;
+        }
+    }
+
+    return -1; /* Not a member of this group */
+}
+
+int security_derive_pairwise_for_peer(
+    const uint8_t* peer_public_key,
+    uint16_t peer_id,
+    uint8_t* shared) {
+    if (!peer_public_key || !shared || peer_id == 0) {
+        return -1;
+    }
+
+    /* Compute ECDH using our identity key and the peer's public key */
+    if (security_compute_shared_secret(peer_public_key, shared) != 0) {
+        return -1;
+    }
+
+    /* Use domain separation with peer_id to derive a pairwise secret suitable for GROUP_JOIN encryption */
+    uint8_t context[24];
+    size_t off = 0;
+    memcpy(context + off, &peer_id, sizeof(peer_id));      off += sizeof(peer_id);
+    memcpy(context + off, "MERIDIAN_GROUP_JOIN_V1", sizeof("MERIDIAN_GROUP_JOIN_V1") - 1);
+
+    uint8_t derived[SHARED_SECRET_LENGTH];
+    crypto_generichash(derived, SHARED_SECRET_LENGTH, shared, SHARED_SECRET_LENGTH, context, sizeof(context));
+    memcpy(shared, derived, SHARED_SECRET_LENGTH);
+    sodium_memzero(derived, sizeof(derived));
+
+    return 0;
 }

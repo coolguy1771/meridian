@@ -32,6 +32,7 @@
 #define KEY_TYPE_IDENTITY      0    /* Long-term X25519 identity key pair */
 #define KEY_TYPE_EPHEMERAL     1    /* Ephemeral handshake key (not persisted long-term) */
 #define KEY_TYPE_NETWORK       3    /* Network-level shared PSK for group comms */
+#define KEY_TYPE_GROUP         4    /* Group symmetric key (PSK per group ID) */
 
 /* Handshake message types */
 #define HANDSHAKE_TYPE_HELLO       0x01
@@ -52,7 +53,17 @@ typedef struct {
     uint8_t active;                               /* 1 = valid session, 0 = expired/invalid */
 } session_info_t;
 
+/* Group key info: stores a shared group PSK per group_id */
+typedef struct {
+    uint16_t group_id;                            /* Group ID this key belongs to */
+    uint8_t  group_key[SYMMETRIC_KEY_LENGTH];     /* Shared symmetric key for the group */
+    uint32_t epoch;                               /* Key rotation epoch counter */
+    uint8_t  leader_id;                           /* Which node is group leader (for revocations) */
+    uint8_t  active;                              /* 1 = valid group membership, 0 = removed/expired */
+} group_key_info_t;
+
 #define MAX_ACTIVE_SESSIONS 16     /* Max concurrent per-peer sessions supported */
+#define MAX_GROUP_KEYS      8      /* Max groups this node can be a member of */
 
 /* Nonce structure: we transmit an 8-byte nonce in the packet header. */
 typedef struct {
@@ -121,11 +132,21 @@ int security_process_handshake(
     uint16_t our_node_id,
     handshake_message_t* response_out);
 
-/* Legacy compatibility wrappers */
-int security_generate_keypair(uint8_t key_type, uint8_t* public_key, uint8_t* private_key);
-int security_derive_keys(const uint8_t* shared_secret, uint8_t* tx_key, uint8_t* rx_key);
-int security_verify_counter_integrity(void);
-int security_store_keys(uint8_t key_type, const uint8_t* public_key, const uint8_t* private_key);
-int security_load_keys(uint8_t key_type, uint8_t* public_key, uint8_t* private_key);
+/* Group key management (leader-based provisioning) */
+
+/* Create or set the shared key for a group; callsite is typically the leader.
+ * On leader: generates if key is NULL; on member: called after receiving GROUP_JOIN from leader. */
+int security_set_group_key(uint16_t group_id, const uint8_t* key_in, uint16_t leader_id);
+
+/* Get the active symmetric key for a specific group (if this node is a member). */
+int security_get_group_key(uint16_t group_id, uint8_t* out_key);
+
+/* Generate the shared secret needed to encrypt a GROUP_JOIN message for a specific peer:
+ * derives an ephemeral pairwise key from our identity and their public key.
+ * Returns 0 on success with 'shared' filled (SHARED_SECRET_LENGTH bytes). */
+int security_derive_pairwise_for_peer(
+    const uint8_t* peer_public_key,
+    uint16_t peer_id,
+    uint8_t* shared);
 
 #endif /* SECURITY_H */

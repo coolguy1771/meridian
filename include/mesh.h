@@ -140,4 +140,28 @@ int mesh_prune_routes(void);
  */
 int mesh_send_beacon(void);
 
+/* Group management API (leader-based provisioning) */
+
+/**
+ * Leader sends a GROUP_JOIN invitation to a specific member node for a group.
+ * If the group key does not exist yet on the leader, it is generated automatically.
+ *
+ * @param leader_id    Node ID of the group leader
+ * @param member_id    Node ID of the new member being invited
+ * @param group_id     Group ID to invite into
+ * @return 0 on success, negative on error
+ */
+int mesh_send_group_join_invite(uint16_t leader_id, uint16_t member_id, uint16_t group_id);
+
+/**
+ * Broadcast a group chat packet encrypted with the shared group key.
+ * Only nodes that are members of this group can decrypt it.
+ *
+ * @param group_id     Group ID for which to broadcast
+ * @param payload      Payload data
+ * @param len          Payload length in bytes
+ * @return 0 on success, negative on error
+ */
+int mesh_broadcast_group_chat(uint16_t group_id, const uint8_t* payload, size_t len);
+
 #endif /* MESH_H */

@@ -24,6 +24,10 @@ static void mesh_rx_handler(uint8_t* data, size_t len, int16_t rssi, int8_t snr)
 static void mesh_tx_handler(void);
 static void mesh_error_handler(uint16_t error);
 
+/* Group management helpers called from examples/app-level code */
+int mesh_send_group_join_invite(uint16_t leader_id, uint16_t member_id, uint16_t group_id);
+int mesh_broadcast_group_chat(uint16_t group_id, const uint8_t* payload, size_t len);
+
 /* Module state */
 static struct {
     uint16_t our_node_id;
@@ -161,8 +165,49 @@ int mesh_process_packet(const packet_t* packet, int16_t rssi, int8_t snr) {
             break;
         }
 
+        case PACKET_TYPE_GROUP_JOIN: {
+            /* GROUP_JOIN is encrypted under the pairwise session key between leader and this node. */
+            uint16_t sender_id = packet->header.source;
+
+            uint8_t sess_key[SYMMETRIC_KEY_LENGTH];
+            int rc = security_get_session_key(sender_id, sess_key);
+            if (rc != 0) {
+                /* No session with sender: ignore this invite */
+                break;
+            }
+
+            uint8_t plain[MAX_PAYLOAD_SIZE];
+            secure_nonce_t nonce;
+            memset(&nonce, 0, sizeof(nonce));
+            memcpy(&nonce.value, &packet->header.nonce_value, 8);
+
+            int dec = security_decrypt(sess_key, &nonce,
+                                       packet->payload, packet->payload_len,
+                                       (uint8_t*)&packet->header, sizeof(packet_header_t),
+                                       packet->tag, plain);
+            if (dec < 0 || (size_t)dec < sizeof(group_join_payload_t)) {
+                break; /* Can't decrypt or too small */
+            }
+
+            group_join_payload_t join;
+            memcpy(&join, plain, sizeof(join));
+
+            /* Store the group key: this node is now a member of that group. */
+            rc = security_set_group_key(join.group_id, join.group_key, sender_id);
+            if (rc != 0) {
+                platform_log(LOG_LEVEL_ERROR, "GROUP_JOIN failed to store key for group %u",
+                             (unsigned)join.group_id);
+            } else {
+                platform_log(LOG_LEVEL_INFO, "Joined group %u from leader %u (epoch=%u)",
+                             (unsigned)join.group_id, sender_id, join.epoch);
+            }
+
+            sodium_memzero(sess_key, sizeof(sess_key));
+            break;
+        }
+
         default:
-            /* Application-level packet: handled by caller or future callback */
+            /* Application-level packet or unknown type */
             break;
     }
 
@@ -521,4 +566,97 @@ static void mesh_tx_handler(void) {
 
 static void mesh_error_handler(uint16_t error) {
     platform_log(LOG_LEVEL_WARNING, "Radio error: 0x%04X", error);
+}
+
+/* ============================================================================
+ * Group management functions: used by application/CLI to manage groups.
+ * ============================================================================ */
+
+int mesh_send_group_join_invite(uint16_t leader_id, uint16_t member_id, uint16_t group_id) {
+    if (member_id == 0 || group_id == 0) {
+        return -1; /* Invalid params */
+    }
+
+    /* Retrieve or create the shared group key on the leader. */
+    uint8_t group_key[SYMMETRIC_KEY_LENGTH];
+    int rc = security_get_group_key(group_id, group_key);
+    if (rc != 0) {
+        /* Leader does not yet have this group: generate a new PSK for it */
+        randombytes_buf(group_key, SYMMETRIC_KEY_LENGTH);
+        rc = security_set_group_key(group_id, group_key, leader_id);
+        if (rc != 0) {
+            return -2; /* Failed to create group key */
+        }
+    }
+
+    /* Ensure pairwise session exists with the member node. */
+    uint8_t sess_key[SYMMETRIC_KEY_LENGTH];
+    rc = security_get_session_key(member_id, sess_key);
+    if (rc != 0) {
+        /* Trigger a handshake first by sending HELLO broadcasted for this member */
+        uint8_t eph_pub[PUBLIC_KEY_LENGTH], eph_priv[PRIVATE_KEY_LENGTH];
+        crypto_box_keypair(eph_pub, eph_priv);
+
+        handshake_message_t hello;
+        memset(&hello, 0, sizeof(hello));
+        hello.type          = HANDSHAKE_TYPE_HELLO;
+        hello.initiator_id  = leader_id;
+        hello.responder_id  = member_id;
+        memcpy(hello.public_key, eph_pub, PUBLIC_KEY_LENGTH);
+
+        packet_t hpkt;
+        if (packet_create(&hpkt, BROADCAST_ADDR, PACKET_TYPE_HANDSHAKE,
+                          (uint8_t*)&hello, sizeof(hello)) == 0) {
+            mesh_send_packet_internal(&hpkt, mesh_state.network_key);
+        }
+
+        platform_delay_ms(100); /* Wait for response in sim; real impl would queue/retry */
+
+        rc = security_get_session_key(member_id, sess_key);
+        if (rc != 0) {
+            sodium_memzero(eph_priv, sizeof(eph_priv));
+            return -3; /* No session with member after handshake attempt */
+        }
+
+        sodium_memzero(eph_priv, sizeof(eph_priv));
+    }
+
+    /* Prepare GROUP_JOIN payload encrypted under pairwise session key */
+    group_join_payload_t join;
+    join.group_id = group_id;
+    join.epoch    = 1; /* V1; bump for future rotations */
+    memcpy(join.group_key, group_key, SYMMETRIC_KEY_LENGTH);
+
+    packet_t pkt;
+    if (packet_create(&pkt, member_id, PACKET_TYPE_GROUP_JOIN,
+                      (uint8_t*)&join, sizeof(join)) != 0) {
+        return -4;
+    }
+
+    rc = mesh_send_packet_internal(&pkt, sess_key);
+
+    sodium_memzero(sess_key, sizeof(sess_key));
+    return rc;
+}
+
+int mesh_broadcast_group_chat(uint16_t group_id, const uint8_t* payload, size_t len) {
+    if (!payload || len > MAX_PAYLOAD_SIZE || group_id == 0) {
+        return -1;
+    }
+
+    /* Get the shared key for this group */
+    uint8_t group_key[SYMMETRIC_KEY_LENGTH];
+    int rc = security_get_group_key(group_id, group_key);
+    if (rc != 0) {
+        return -2; /* Not a member of this group */
+    }
+
+    packet_t pkt;
+    if (packet_create(&pkt, BROADCAST_ADDR, PACKET_TYPE_GROUP_CHAT, payload, len) != 0) {
+        return -3;
+    }
+
+    /* Encrypt with group key and broadcast */
+    pkt.header.ttl = MAX_TTL; /* Propagate throughout the mesh */
+    return mesh_send_packet_internal(&pkt, group_key);
 }
