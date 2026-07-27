@@ -14,7 +14,7 @@
 #define MAX_ROUTE_ENTRIES 32
 
 /* Maximum time to keep a route entry (in milliseconds) */
-#define ROUTE_TIMEOUT_MS 300000 /* 5 minutes */
+#define ROUTE_TIMEOUT_MS 600000 /* 10 minutes, overridden in mesh.c if needed */
 
 /* Routing entry */
 typedef struct {
