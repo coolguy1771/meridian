@@ -129,15 +129,15 @@ int main(void) {
         return 1;
     }
 
-    printf("Session established with node %04X\n", confirm.responder_id);
-
-    /* Verify we can look up the session key */
+    /* Verify we can look up the session key before assuming success */
     uint8_t derived_key[SYMMETRIC_KEY_LENGTH];
-    rc = security_get_session_key(0x0002, derived_key);
+    rc = security_get_session_key(confirm.responder_id, derived_key);
     if (rc != 0) {
-        fprintf(stderr, "Session key lookup failed: %d\n", rc);
+        fprintf(stderr, "Session established but key lookup failed for %04X: %d\n", confirm.responder_id, rc);
         return 1;
     }
+
+    printf("Session established with node %04X\n", confirm.responder_id);
 
     printf("Session key length: %zu bytes\n", SYMMETRIC_KEY_LENGTH);
     printf("First 4 bytes of session key: %02X %02X %02X %02X\n",

@@ -77,11 +77,19 @@ int main(void) {
     packet_t pkt;
     if (packet_create(&pkt, PEER_NODE_ID, PACKET_TYPE_VOICE,
                       voice_frame, sizeof(voice_frame)) != 0) {
+        /* Cleanup on failure */
+        sodium_memzero(eph_priv, sizeof(eph_priv));
+        sodium_memzero(peer_priv, sizeof(peer_priv));
+        sodium_memzero(resp_eph_priv, sizeof(resp_eph_priv));
         fprintf(stderr, "Voice packet creation failed\n");
         return 1;
     }
 
     if (packet_encrypt(&pkt, frame_key) != 0) {
+        sodium_memzero(frame_key, sizeof(frame_key));
+        sodium_memzero(eph_priv, sizeof(eph_priv));
+        sodium_memzero(peer_priv, sizeof(peer_priv));
+        sodium_memzero(resp_eph_priv, sizeof(resp_eph_priv));
         fprintf(stderr, "Voice packet encryption failed\n");
         return 1;
     }
@@ -89,6 +97,10 @@ int main(void) {
     uint8_t wire_buf[MAX_PACKET_SIZE];
     int len = packet_serialize(&pkt, wire_buf, sizeof(wire_buf));
     if (len <= 0) {
+        sodium_memzero(frame_key, sizeof(frame_key));
+        sodium_memzero(eph_priv, sizeof(eph_priv));
+        sodium_memzero(peer_priv, sizeof(peer_priv));
+        sodium_memzero(resp_eph_priv, sizeof(resp_eph_priv));
         fprintf(stderr, "Serialization failed\n");
         return 1;
     }
@@ -107,11 +119,21 @@ int main(void) {
 
     packet_t recv_pkt;
     if (packet_deserialize(wire_buf, len, &recv_pkt) != 0) {
+        sodium_memzero(frame_key, sizeof(frame_key));
+        sodium_memzero(peer_key, sizeof(peer_key));
+        sodium_memzero(eph_priv, sizeof(eph_priv));
+        sodium_memzero(peer_priv, sizeof(peer_priv));
+        sodium_memzero(resp_eph_priv, sizeof(resp_eph_priv));
         fprintf(stderr, "Deserialization failed\n");
         return 1;
     }
 
     if (packet_decrypt(&recv_pkt, peer_key) != 0) {
+        sodium_memzero(frame_key, sizeof(frame_key));
+        sodium_memzero(peer_key, sizeof(peer_key));
+        sodium_memzero(eph_priv, sizeof(eph_priv));
+        sodium_memzero(peer_priv, sizeof(peer_priv));
+        sodium_memzero(resp_eph_priv, sizeof(resp_eph_priv));
         fprintf(stderr, "Voice decryption failed\n");
         return 1;
     }

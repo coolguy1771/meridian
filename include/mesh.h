@@ -52,7 +52,7 @@ int mesh_init(uint16_t our_node_id);
  * @param snr Signal-to-noise ratio of received packet
  * @return 0 on success, negative on error
  */
-int mesh_process_packet(const packet_t* packet, int16_t rssi, int8_t snr);
+int mesh_process_packet(const packet_t* packet, uint16_t from_node, int16_t rssi, int8_t snr);
 
 /**
  * Send a packet through the mesh network

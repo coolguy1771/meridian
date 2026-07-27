@@ -1,6 +1,6 @@
 # MERIDIAN: Multiband Encrypted Radio for Independent Distance-Intensive Adaptive Networking
 
-Meridian is a secure, multiband LoRa mesh radio firmware designed as an alternative to Meshtastic. It implements end-to-end encryption with forward secrecy via ephemeral ECDH key exchanges, sliding-window replay protection, and dynamic band selection across 433/868/915 MHz.
+Meridian is a secure, multiband LoRa mesh radio firmware designed as an alternative to Meshtastic. It implements end-to-end encryption using X25519 identity keys for pairwise session key derivation, XChaCha20-Poly1305 AEAD encryption of application payloads, and dynamic band selection across 433/868/915 MHz.
 
 ## Architecture Overview
 
@@ -18,10 +18,11 @@ Meridian uses a layered security approach:
 
 1. **Identity Layer**: Each node has a long-term X25519 identity key pair stored in flash (encrypted with a device secret). Keys are HMAC-SHA256 integrity-protected and persist across reboots.
 
-2. **Key Exchange**: Nodes establish pairwise sessions via an ephemeral ECDH handshake:
-   - Initiator sends `HELLO` with its X25519 public key (broadcast)
-   - Responder derives shared secret via ECDH(identity_priv, initiator_pub), sends `RESPONSE`
+2. **Key Exchange**: Nodes establish pairwise sessions via a static identity-based ECDH handshake:
+   - Initiator sends `HELLO` with its X25519 identity public key (broadcast)
+   - Responder derives shared secret via ECDH(responder_priv, initiator_pub), responds with its own identity public key in `RESPONSE`
    - Both sides derive symmetric session keys using BLAKE2b-based KDF with node IDs as domain separation
+   - *Note: Current v1 uses static identity keys only (no ephemeral components). Long-term key compromise would allow decryption of historical traffic. Future versions may add ephemeral ECDH for forward secrecy.*
 
 3. **Packet Encryption**: All data packets use XChaCha20-Poly1305 AEAD (libsodium). Nonces are constructed from a persistent monotonic counter plus randomized low bits, preventing reuse under the same session key.
 

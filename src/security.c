@@ -60,7 +60,11 @@ int security_init(uint8_t mode, uint8_t cipher) {
     sec_state.identity_loaded = 0;
     memset(&sec_state.sessions, 0, sizeof(sec_state.sessions));
 
-    /* Load or generate device secret used for HMAC of stored data */
+    /* Load or generate device secret used for HMAC of stored data.
+     * NOTE: In production, this should be derived from hardware calibration area,
+     * secure element (ATECC608B/C), or factory-provisioned unique key rather than
+     * stored as raw bytes in flash memory here. This plaintext storage is acceptable
+     * for simulation/demo on Linux but must be hardened for deployed hardware. */
     uint8_t tmp_secret[32];
     if (platform_flash_read(FLASH_ADDR_IDENTITY_KEY + 128, tmp_secret, 32) == 0 &&
         !sodium_is_zero(tmp_secret, 32)) {
@@ -73,7 +77,10 @@ int security_init(uint8_t mode, uint8_t cipher) {
     /* Unique device ID */
     platform_get_unique_id(sec_state.node_id, NODE_ID_LENGTH);
 
-    /* Load monotonic counter from flash or initialize new */
+    /* Load monotonic counter from flash or initialize new.
+     * Counter is HMAC-integrity-protected to detect corruption. On first boot or
+     * invalid flash state, we randomize the start point within a large range to avoid
+     * nonce collisions across nodes that may be provisioned in parallel. */
     memset(&sec_state.counter_primary, 0, sizeof(monotonic_counter_t));
     uint8_t stored_ctr[sizeof(monotonic_counter_t)];
     platform_flash_read(FLASH_ADDR_COUNTER_PRIMARY, stored_ctr, sizeof(stored_ctr));
@@ -171,17 +178,28 @@ int security_encrypt(
     }
 
     /* Derive a full 24-byte XChaCha20 nonce deterministically from our 8-byte protocol nonce.
-     * Structure: [hash(nonce_value || context, key)[..15] | nonce_value (8 bytes)] */
+     * We hash the protocol nonce together with a fixed context tag using BLAKE2b keyed by
+     * the symmetric session key to get a unique 16-byte prefix, then append the nonce itself
+     * for full 24-byte XChaCha20 extended nonces: [hash(prefix)[..15] | nonce_value(8 bytes)] */
     uint8_t xnonce[24];
     {
-        uint8_t ctx_input[16];
-        size_t off = 0;
-        memcpy(ctx_input + off, &nonce->value, sizeof(nonce->value));          off += sizeof(nonce->value);
-        memcpy(ctx_input + off, "MERIDIAN_XNONCE_V1", sizeof("MERIDIAN_XNONCE_V1") - 1);
+        /* Input buffer: nonce_value(8) concatenated with context tag string ("MERIDIAN_XNONCE_V1") */
+        uint8_t input_buf[64]; /* plenty of space for combined data */
+        size_t in_len = 0;
+
+        memcpy(input_buf + in_len, &nonce->value, sizeof(nonce->value));
+        in_len += sizeof(nonce->value);
+
+        const char ctx_str[] = "MERIDIAN_XNONCE_V1";
+        size_t ctx_len = sizeof(ctx_str) - 1;
+        memcpy(input_buf + in_len, (const uint8_t*)ctx_str, ctx_len);
+        in_len += ctx_len;
 
         uint8_t h[32];
-        crypto_generichash(h, sizeof(h), ctx_input, sizeof(ctx_input), key, SYMMETRIC_KEY_LENGTH);
-        memcpy(xnonce, h, 16);              /* bytes 0..15 */
+        /* crypto_generichash(out, outlen, msg, msglen, key, keylen) = BLAKE2b keyed hash */
+        crypto_generichash(h, sizeof(h), input_buf, in_len, key, SYMMETRIC_KEY_LENGTH);
+
+        memcpy(xnonce, h, 16);              /* bytes 0..15 = hash prefix */
         memcpy(xnonce + 16, &nonce->value, sizeof(nonce->value));  /* bytes 16..23 = protocol nonce */
         sodium_memzero(h, sizeof(h));
     }
@@ -218,14 +236,21 @@ int security_decrypt(
     /* Derive xnonce the exact same way as security_encrypt */
     uint8_t xnonce[24];
     {
-        uint8_t ctx_input[16];
-        size_t off = 0;
-        memcpy(ctx_input + off, &nonce->value, sizeof(nonce->value));          off += sizeof(nonce->value);
-        memcpy(ctx_input + off, "MERIDIAN_XNONCE_V1", sizeof("MERIDIAN_XNONCE_V1") - 1);
+        uint8_t input_buf[64];
+        size_t in_len = 0;
+
+        memcpy(input_buf + in_len, &nonce->value, sizeof(nonce->value));
+        in_len += sizeof(nonce->value);
+
+        const char ctx_str[] = "MERIDIAN_XNONCE_V1";
+        size_t ctx_len = sizeof(ctx_str) - 1;
+        memcpy(input_buf + in_len, (const uint8_t*)ctx_str, ctx_len);
+        in_len += ctx_len;
 
         uint8_t h[32];
-        crypto_generichash(h, sizeof(h), ctx_input, sizeof(ctx_input), key, SYMMETRIC_KEY_LENGTH);
-        memcpy(xnonce, h, 16);              /* bytes 0..15 */
+        crypto_generichash(h, sizeof(h), input_buf, in_len, key, SYMMETRIC_KEY_LENGTH);
+
+        memcpy(xnonce, h, 16);              /* bytes 0..15 = hash prefix */
         memcpy(xnonce + 16, &nonce->value, sizeof(nonce->value));  /* bytes 16..23 = protocol nonce */
         sodium_memzero(h, sizeof(h));
     }
@@ -379,14 +404,17 @@ int security_set_session(uint16_t peer_id, const uint8_t* session_key) {
         }
     }
     if (idx < 0) {
-        /* Table full: evict oldest */
+        /* Table full: evict oldest entry by established_time */
+        int evict = 0;
         uint32_t oldest_time = sec_state.sessions[0].established_time;
         for (int i = 1; i < MAX_ACTIVE_SESSIONS; i++) {
-            if (sec_state.sessions[i].established_time < oldest_time) {
+            if (!sec_state.sessions[i].active ||
+                sec_state.sessions[i].established_time < oldest_time) {
                 oldest_time = sec_state.sessions[i].established_time;
-                idx = i;
+                evict = i;
             }
         }
+        idx = evict;
     }
 
     memcpy(sec_state.sessions[idx].session_key, session_key, SYMMETRIC_KEY_LENGTH);
@@ -434,9 +462,16 @@ int security_process_handshake(
     }
     memset(response_out, 0, sizeof(*response_out));
 
-    /* We are responder: received HELLO */
+    /* Protocol v2: uses static identity ECDH (no forward secrecy yet).
+     * Flow:
+     *   HELLO: initiator sends type=HELLO, initiator_id=I, responder_id=R, public_key = initiator_identity_pub.
+     *   RESPONDER branch below: derives session_key via DH(init_priv, initiator_pub), sends back its own identity pub.
+     *   INITIATOR branch (on RESPONSE): derives same session_key via DH(our_priv, responder.pub).
+     */
+
+    /* We are responder: received HELLO with initiator's identity public key */
     if (msg->type == HANDSHAKE_TYPE_HELLO && msg->responder_id == our_node_id) {
-        if (sodium_is_zero(msg->public_key, PUBLIC_KEY_LENGTH)) {
+        if (!sec_state.identity_loaded || sodium_is_zero(msg->public_key, PUBLIC_KEY_LENGTH)) {
             return -2;
         }
 
@@ -446,7 +481,7 @@ int security_process_handshake(
         }
 
         uint8_t sess_key[SYMMETRIC_KEY_LENGTH];
-        security_derive_session_key(shared, our_node_id, msg->initiator_id, sess_key);
+        security_derive_session_key(shared, msg->initiator_id, our_node_id, sess_key);
         security_set_session(msg->initiator_id, sess_key);
         sodium_memzero(shared, sizeof(shared));
         sodium_memzero(sess_key, sizeof(sess_key));
@@ -454,15 +489,19 @@ int security_process_handshake(
         response_out->type = HANDSHAKE_TYPE_RESPONSE;
         response_out->initiator_id = msg->initiator_id;
         response_out->responder_id = our_node_id;
+        memcpy(response_out->public_key, sec_state.id_pub, PUBLIC_KEY_LENGTH);
         return 0;
     }
 
-    /* We are initiator: received RESPONSE confirming session */
+    /* We are initiator: received RESPONSE with responder's identity public key */
     if (msg->type == HANDSHAKE_TYPE_RESPONSE && msg->initiator_id == our_node_id) {
-        /* Session key already derived by responder; we re-derive locally via identity DH */
+        if (!sec_state.identity_loaded || sodium_is_zero(msg->public_key, PUBLIC_KEY_LENGTH)) {
+            return -4;
+        }
+
         uint8_t shared[SHARED_SECRET_LENGTH];
         if (security_compute_shared_secret(msg->public_key, shared) != 0) {
-            return -3;
+            return -5;
         }
 
         uint8_t sess_key[SYMMETRIC_KEY_LENGTH];
@@ -477,7 +516,7 @@ int security_process_handshake(
         return 0;
     }
 
-    return -4; /* Unhandled handshake message type */
+    return -99; /* Unhandled handshake message type */
 }
 
 /* ============================================================================

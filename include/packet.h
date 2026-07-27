@@ -35,7 +35,7 @@ typedef struct __attribute__((packed)) {
 #define MAX_TTL                   10    /* Max TTL/hops */
 #define BROADCAST_ADDR            0xFFFF
 
-/* Header structure: 18 bytes packed. Includes band_info for routing + full nonce value. */
+/* Header structure: 20 bytes packed (2+2+1+1+4+1+1+8). Includes band_info for routing + full nonce value. */
 typedef struct __attribute__((packed)) {
     uint16_t destination;       /* Destination node ID (or BROADCAST_ADDR) */
     uint16_t source;            /* Source node ID */

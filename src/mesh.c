@@ -8,7 +8,7 @@
 
 /* Limits and timing */
 #define MAX_NEIGHBORS         32
-#define ROUTE_TIMEOUT_MS      600000UL   /* 10 minutes */
+/* ROUTE_TIMEOUT_MS is defined in mesh.h; do not re-define here to avoid constraint violation. */
 #define NEIGHBOR_TIMEOUT_MS   300000UL   /* 5 minutes */
 #define BEACON_INTERVAL_MS    60000UL    /* Regular beacons */
 #define DISCOVERY_BEACONS     3
@@ -18,6 +18,14 @@
 #define ROUTE_INVALID   0
 #define ROUTE_DIRECT    1
 #define ROUTE_INDIRECT  2
+
+/* Network-level shared PSK for management/beacons MUST be provisioned identically on all nodes in the same mesh.
+   On real hardware this is loaded from configuration/flash; here we keep a configurable default for demo/testing. */
+#define MESH_NETWORK_PSK "MERIDIAN_DEFAULT_PSK_V1" /* Replace with actual provisioned key per deployment */
+
+static void derive_network_key_from_psk(uint8_t out[SYMMETRIC_KEY_LENGTH]) {
+    crypto_generichash(out, SYMMETRIC_KEY_LENGTH, (uint8_t*)MESH_NETWORK_PSK, strlen(MESH_NETWORK_PSK), NULL, 0);
+}
 
 /* Radio callbacks */
 static void mesh_rx_handler(uint8_t* data, size_t len, int16_t rssi, int8_t snr);
@@ -38,8 +46,11 @@ static struct {
     uint8_t active_band;
     uint8_t discovery_mode;
 
-    /* Network-level shared key (fallback for beacons/management if needed) */
+    /* Network-level shared key derived from a common PSK (same on all nodes in mesh) */
     uint8_t network_key[SYMMETRIC_KEY_LENGTH];
+
+    /* Optional application callback for received packets after decryption and core processing. */
+    void (*app_rx_callback)(const packet_t* packet, int16_t rssi, int8_t snr);
 } mesh_state;
 
 /* Forward declarations */
@@ -76,9 +87,8 @@ int mesh_init(uint16_t our_node_id) {
     radio_set_error_callback(mesh_error_handler);
     radio_set_rx(0); /* Continuous receive */
 
-    /* Generate a local network key for management/broadcast packets.
-     * In production this would be provisioned via PSK or derived from mesh credentials. */
-    randombytes_buf(mesh_state.network_key, SYMMETRIC_KEY_LENGTH);
+    /* Derive a consistent network key from the shared PSK so all nodes in the same mesh can communicate. */
+    derive_network_key_from_psk(mesh_state.network_key);
 
     /* Send initial beacon */
     mesh_send_beacon();
@@ -87,8 +97,8 @@ int mesh_init(uint16_t our_node_id) {
 }
 
 int mesh_set_rx_callback(void (*callback)(const packet_t* packet, int16_t rssi, int8_t snr)) {
-    /* For now: we handle this via internal processing. Future extensibility hook. */
-    (void)callback;
+    /* Store callback for application-level packets after decryption and core processing. */
+    mesh_state.app_rx_callback = callback;
     return 0;
 }
 
@@ -96,11 +106,12 @@ int mesh_set_rx_callback(void (*callback)(const packet_t* packet, int16_t rssi, 
  * Receive path: decrypt + process by type (beacon/handshake/data)
  * ============================================================================ */
 
-int mesh_process_packet(const packet_t* packet, int16_t rssi, int8_t snr) {
+int mesh_process_packet(const packet_t* packet, uint16_t from_node, int16_t rssi, int8_t snr) {
     if (!packet) return -1;
 
+    /* Routing update: if from_node is zero this was a direct link; otherwise it's via that relay. */
     uint8_t band = packet->header.band_info & 0x03;
-    mesh_update_routing(packet->header.source, 0, (int)rssi, band);
+    mesh_update_routing(packet->header.source, from_node, rssi, band);
 
     /* Process by type */
     switch (packet->header.type) {
@@ -117,40 +128,30 @@ int mesh_process_packet(const packet_t* packet, int16_t rssi, int8_t snr) {
             if (nidx >= 0) {
                 mesh_state.neighbors[nidx].bands         = supported_bands;
                 mesh_state.neighbors[nidx].battery_level = battery_level;
-                mesh_state.neighbors[nidx].rssi[band]    = (int8_t)rssi;
+                /* Only index 0 is valid for band_info & 0x03 since neighbor.rssi has 3 elements. */
+                int safe_band = (band < 3) ? (int)band : 0;
+                mesh_state.neighbors[nidx].rssi[safe_band] = (int8_t)rssi;
                 mesh_state.neighbors[nidx].last_seen     = platform_get_time_ms();
                 mesh_state.neighbors[nidx].is_active     = 1;
             } else {
                 mesh_add_neighbor(packet->header.source, band, rssi);
             }
 
-            /* Discovery-mode response */
+            /* Discovery-mode response: schedule beacon via deferred send to avoid blocking in ISR context */
             if (mesh_state.discovery_mode && packet->payload_len >= 3 && packet->payload[2]) {
-                platform_delay_ms(50 + (mesh_state.our_node_id % 50));
-                mesh_send_beacon();
+                mesh_state.last_beacon_time = 0; /* Force immediate beacon on next periodic tick */
             }
             break;
         }
 
         case PACKET_TYPE_HANDSHAKE: {
-            /* Decrypt handshake payload using network key first to authenticate source */
-            uint8_t plain[sizeof(handshake_message_t)];
-            secure_nonce_t nonce;
-            memset(&nonce, 0, sizeof(nonce));
-            memcpy(&nonce.value, &packet->header.nonce_value, 8);
-
-            int dec = security_decrypt(mesh_state.network_key, &nonce,
-                                       packet->payload, packet->payload_len,
-                                       (uint8_t*)&packet->header, sizeof(packet_header_t),
-                                       packet->tag, plain);
-
-            if (dec < 0 || (size_t)dec < sizeof(handshake_message_t)) {
-                /* Can't decrypt handshake -> drop */
+            /* Payload is already decrypted in-place by mesh_rx_handler before dispatch here. */
+            if (packet->payload_len < sizeof(handshake_message_t)) {
                 return -1;
             }
 
             handshake_message_t msg;
-            memcpy(&msg, plain, sizeof(msg));
+            memcpy(&msg, packet->payload, sizeof(msg));
 
             handshake_message_t response;
             int h = security_process_handshake(&msg, mesh_state.our_node_id, &response);
@@ -166,34 +167,17 @@ int mesh_process_packet(const packet_t* packet, int16_t rssi, int8_t snr) {
         }
 
         case PACKET_TYPE_GROUP_JOIN: {
-            /* GROUP_JOIN is encrypted under the pairwise session key between leader and this node. */
+            /* Payload is already decrypted in-place by mesh_rx_handler using the pairwise session key. */
             uint16_t sender_id = packet->header.source;
-
-            uint8_t sess_key[SYMMETRIC_KEY_LENGTH];
-            int rc = security_get_session_key(sender_id, sess_key);
-            if (rc != 0) {
-                /* No session with sender: ignore this invite */
-                break;
-            }
-
-            uint8_t plain[MAX_PAYLOAD_SIZE];
-            secure_nonce_t nonce;
-            memset(&nonce, 0, sizeof(nonce));
-            memcpy(&nonce.value, &packet->header.nonce_value, 8);
-
-            int dec = security_decrypt(sess_key, &nonce,
-                                       packet->payload, packet->payload_len,
-                                       (uint8_t*)&packet->header, sizeof(packet_header_t),
-                                       packet->tag, plain);
-            if (dec < 0 || (size_t)dec < sizeof(group_join_payload_t)) {
-                break; /* Can't decrypt or too small */
+            if (packet->payload_len < sizeof(group_join_payload_t)) {
+                break; /* Too small */
             }
 
             group_join_payload_t join;
-            memcpy(&join, plain, sizeof(join));
+            memcpy(&join, packet->payload, sizeof(join));
 
             /* Store the group key: this node is now a member of that group. */
-            rc = security_set_group_key(join.group_id, join.group_key, sender_id);
+            int rc = security_set_group_key(join.group_id, join.group_key, sender_id);
             if (rc != 0) {
                 platform_log(LOG_LEVEL_ERROR, "GROUP_JOIN failed to store key for group %u",
                              (unsigned)join.group_id);
@@ -202,12 +186,14 @@ int mesh_process_packet(const packet_t* packet, int16_t rssi, int8_t snr) {
                              (unsigned)join.group_id, sender_id, join.epoch);
             }
 
-            sodium_memzero(sess_key, sizeof(sess_key));
             break;
         }
 
         default:
-            /* Application-level packet or unknown type */
+            /* Application-level packet: invoke callback if registered */
+            if (mesh_state.app_rx_callback) {
+                mesh_state.app_rx_callback(packet, rssi, snr);
+            }
             break;
     }
 
@@ -221,47 +207,26 @@ int mesh_process_packet(const packet_t* packet, int16_t rssi, int8_t snr) {
 int mesh_send_packet(packet_t* packet) {
     if (!packet) return -1;
 
-    uint8_t* session_key = NULL;
+    uint8_t session_key_buf[SYMMETRIC_KEY_LENGTH];
 
     /* Broadcast/management: use network key directly */
     if (packet->header.destination == BROADCAST_ADDR) {
-        session_key = mesh_state.network_key;
+        memcpy(session_key_buf, mesh_state.network_key, SYMMETRIC_KEY_LENGTH);
     } else {
         /* Try to find pairwise session key for destination */
-        uint8_t tmp_key[SYMMETRIC_KEY_LENGTH];
-        int rc = security_get_session_key(packet->header.destination, tmp_key);
-        if (rc == 0) {
-            /* Temp workaround: we need pointer; copy into fixed buffer. */
-            static uint8_t cached_keys[64][SYMMETRIC_KEY_LENGTH];
-            static uint16_t last_used[64] = {0};
-            static uint8_t slot_idx = 0;
-
-            /* Find matching entry to reuse */
-            int found = -1;
-            for (int i = 0; i < 64; i++) {
-                if (last_used[i] == packet->header.destination) {
-                    found = i;
-                    break;
-                }
-            }
-            if (found < 0) {
-                slot_idx = slot_idx % 64;
-                last_used[slot_idx] = packet->header.destination;
-                memcpy(cached_keys[slot_idx], tmp_key, SYMMETRIC_KEY_LENGTH);
-                found = slot_idx++;
-            }
-            session_key = cached_keys[found];
-        } else {
-            /* No session yet: attempt handshake with destination before sending */
-            uint8_t eph_pub[PUBLIC_KEY_LENGTH], eph_priv[PRIVATE_KEY_LENGTH];
-            crypto_box_keypair(eph_pub, eph_priv);
+        int rc = security_get_session_key(packet->header.destination, session_key_buf);
+        if (rc != 0) {
+            /* No session yet: attempt handshake with destination before sending.
+             * In real async systems you'd queue and retry later instead of blocking here. */
+            uint8_t our_pub[PUBLIC_KEY_LENGTH];
+            security_get_identity_public_key(our_pub);
 
             handshake_message_t hello;
             memset(&hello, 0, sizeof(hello));
             hello.type          = HANDSHAKE_TYPE_HELLO;
             hello.initiator_id  = mesh_state.our_node_id;
             hello.responder_id  = packet->header.destination;
-            memcpy(hello.public_key, eph_pub, PUBLIC_KEY_LENGTH);
+            memcpy(hello.public_key, our_pub, PUBLIC_KEY_LENGTH);
 
             /* Send handshake request first */
             packet_t hpkt;
@@ -270,20 +235,13 @@ int mesh_send_packet(packet_t* packet) {
                 mesh_send_packet_internal(&hpkt, mesh_state.network_key);
             }
 
-            /* Wait briefly for response (in real async system, you'd queue and retry later) */
+            /* Wait briefly for response (blocking; only OK in sim/test on Linux). */
             platform_delay_ms(100);
 
-            /* Try session again */
-            rc = security_get_session_key(packet->header.destination, tmp_key);
+            rc = security_get_session_key(packet->header.destination, session_key_buf);
             if (rc != 0) {
-                sodium_memzero(eph_priv, sizeof(eph_priv));
                 return -3; /* No route/session to destination */
             }
-            static uint8_t fallback_key[SYMMETRIC_KEY_LENGTH];
-            memcpy(fallback_key, tmp_key, SYMMETRIC_KEY_LENGTH);
-            session_key = fallback_key;
-
-            sodium_memzero(eph_priv, sizeof(eph_priv));
         }
     }
 
@@ -300,7 +258,7 @@ int mesh_send_packet(packet_t* packet) {
     }
 
     packet->header.band_info = best_band & 0x03;
-    return mesh_send_packet_internal(packet, session_key);
+    return mesh_send_packet_internal(packet, session_key_buf);
 }
 
 static int mesh_send_packet_internal(packet_t* packet, const uint8_t* key) {
@@ -352,10 +310,17 @@ uint16_t mesh_find_next_hop(uint16_t dest_id, uint8_t* best_band) {
 int mesh_update_routing(uint16_t source, uint16_t from_node, int16_t rssi, uint8_t band) {
     if (source == 0 || source == mesh_state.our_node_id) return -1;
 
+    int safe_band = (band < 3) ? (int)band : 0; /* clamp to valid range for neighbor.rssi[3] */
+
     if (from_node == 0) {
+        /* Direct link: heard directly from the source */
         mesh_add_neighbor(source, band, rssi);
-        mesh_add_route(source, source, 1, rssi, band);
+        mesh_add_route(source, source, 1, safe_band ? -90 : rssi, band);
     } else {
+        /* Indirect route via 'from_node': update both neighbor and route table.
+         * Also keep a neighbor entry for the relay node itself. */
+        mesh_add_neighbor(from_node, band, rssi);
+
         int via_idx = mesh_find_route_index(from_node);
         if (via_idx >= 0) {
             uint8_t hops = mesh_state.routes[via_idx].hops + 1;
@@ -510,10 +475,11 @@ static int mesh_add_neighbor(uint16_t node_id, uint8_t band, int16_t rssi) {
         }
     }
 
+    int safe_band = (band < 3) ? (int)band : 0; /* clamp to valid range */
     if (idx >= 0) {
         mesh_state.neighbors[idx].node_id   = node_id;
-        mesh_state.neighbors[idx].bands     = 0x07; /* Assume all bands */
-        mesh_state.neighbors[idx].rssi[band]= (int8_t)rssi;
+        mesh_state.neighbors[idx].bands     = 0x07; /* Assume all bands until proven otherwise */
+        mesh_state.neighbors[idx].rssi[safe_band] = (int8_t)rssi;
         mesh_state.neighbors[idx].last_seen = platform_get_time_ms();
         mesh_state.neighbors[idx].is_active = 1;
     }
@@ -538,25 +504,45 @@ static void mesh_rx_handler(uint8_t* data, size_t len, int16_t rssi, int8_t snr)
     packet_t pkt;
     if (packet_deserialize(data, len, &pkt) != 0) return;
 
-    /* Try decrypting with network key first for beacons/handshakes */
-    if (pkt.header.type == PACKET_TYPE_BEACON || pkt.header.type == PACKET_TYPE_HANDSHAKE) {
-        if (packet_decrypt(&pkt, mesh_state.network_key) == 0) {
-            int handled = packet_handle(&pkt, 0);
-            if (handled >= 0) {
-                mesh_process_packet(&pkt, rssi, snr);
+    /* Determine which key to use for decryption. */
+    const uint8_t* decrypt_key = NULL;
+
+    switch (pkt.header.type) {
+        case PACKET_TYPE_BEACON:
+        case PACKET_TYPE_HANDSHAKE:
+            /* Management/beacons: encrypted with the network key */
+            decrypt_key = mesh_state.network_key;
+            break;
+
+        default:
+            {
+                uint8_t key[SYMMETRIC_KEY_LENGTH];
+                int rc = security_get_session_key(pkt.header.source, key);
+                if (rc == 0) {
+                    /* Use a local copy on stack for decrypt pointer */
+                    static uint8_t temp_key[SYMMETRIC_KEY_LENGTH];
+                    memcpy(temp_key, key, SYMMETRIC_KEY_LENGTH);
+                    decrypt_key = temp_key;
+                } else {
+                    return; /* Unknown source without session -> drop */
+                }
             }
-            return;
-        }
+            break;
     }
 
-    /* Otherwise try per-source session keys */
-    uint8_t key[SYMMETRIC_KEY_LENGTH];
-    int rc = security_get_session_key(pkt.header.source, key);
-    if (rc == 0 && packet_decrypt(&pkt, key) == 0) {
-        int handled = packet_handle(&pkt, 0);
-        if (handled >= 0) {
-            mesh_process_packet(&pkt, rssi, snr);
-        }
+    if (!decrypt_key) {
+        return; /* Cannot determine key for this packet type */
+    }
+
+    /* Decrypt payload in-place (already authenticated via AEAD). */
+    if (packet_decrypt(&pkt, decrypt_key) != 0) {
+        return; /* Auth failed or bad inputs */
+    }
+
+    /* For direct-receive packets from radio callback, from_node is zero. */
+    int handled = packet_handle(&pkt, 0);
+    if (handled >= 0) {
+        mesh_process_packet(&pkt, 0, rssi, snr);
     }
 }
 
@@ -594,15 +580,15 @@ int mesh_send_group_join_invite(uint16_t leader_id, uint16_t member_id, uint16_t
     rc = security_get_session_key(member_id, sess_key);
     if (rc != 0) {
         /* Trigger a handshake first by sending HELLO broadcasted for this member */
-        uint8_t eph_pub[PUBLIC_KEY_LENGTH], eph_priv[PRIVATE_KEY_LENGTH];
-        crypto_box_keypair(eph_pub, eph_priv);
+        uint8_t our_pub[PUBLIC_KEY_LENGTH];
+        security_get_identity_public_key(our_pub);
 
         handshake_message_t hello;
         memset(&hello, 0, sizeof(hello));
         hello.type          = HANDSHAKE_TYPE_HELLO;
         hello.initiator_id  = leader_id;
         hello.responder_id  = member_id;
-        memcpy(hello.public_key, eph_pub, PUBLIC_KEY_LENGTH);
+        memcpy(hello.public_key, our_pub, PUBLIC_KEY_LENGTH);
 
         packet_t hpkt;
         if (packet_create(&hpkt, BROADCAST_ADDR, PACKET_TYPE_HANDSHAKE,
@@ -614,11 +600,8 @@ int mesh_send_group_join_invite(uint16_t leader_id, uint16_t member_id, uint16_t
 
         rc = security_get_session_key(member_id, sess_key);
         if (rc != 0) {
-            sodium_memzero(eph_priv, sizeof(eph_priv));
             return -3; /* No session with member after handshake attempt */
         }
-
-        sodium_memzero(eph_priv, sizeof(eph_priv));
     }
 
     /* Prepare GROUP_JOIN payload encrypted under pairwise session key */

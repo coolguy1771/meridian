@@ -80,10 +80,18 @@ int packet_encrypt(packet_t* packet, const uint8_t* key) {
 
     uint8_t ciphertext[MAX_PAYLOAD_SIZE];
 
+    /* AAD: authenticate non-mutable parts of the header only.
+     * Mutable fields must be excluded because relays may change them:
+     *   - ttl: decremented by each hop when forwarding a packet.
+     * Binding nonce_value + addressing fields is correct; ttl is intentionally omitted. */
+    uint8_t aad_buf[sizeof(packet_header_t)];
+    memcpy(aad_buf, &packet->header, sizeof(packet_header_t));
+    memset(aad_buf + offsetof(packet_header_t, ttl), 0, sizeof(uint8_t));
+
     int result = security_encrypt(
         key, &nonce,
         packet->payload, packet->payload_len,
-        (uint8_t*)&packet->header, sizeof(packet_header_t),
+        aad_buf, sizeof(aad_buf),
         ciphertext, packet->tag);
 
     if (result < 0) {
@@ -111,10 +119,15 @@ int packet_decrypt(packet_t* packet, const uint8_t* key) {
 
     uint8_t plaintext[MAX_PAYLOAD_SIZE];
 
+    /* AAD: match the encryption-side logic by zeroing out mutable ttl field. */
+    uint8_t aad_buf[sizeof(packet_header_t)];
+    memcpy(aad_buf, &packet->header, sizeof(packet_header_t));
+    memset(aad_buf + offsetof(packet_header_t, ttl), 0, sizeof(uint8_t));
+
     int result = security_decrypt(
         key, &nonce,
         packet->payload, packet->payload_len,
-        (uint8_t*)&packet->header, sizeof(packet_header_t),
+        aad_buf, sizeof(aad_buf),
         packet->tag, plaintext);
 
     if (result < 0) {
