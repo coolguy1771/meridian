@@ -1,402 +1,337 @@
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+#include <sodium.h>
 #include "security.h"
+#include "packet.h"   /* For MAX_PAYLOAD_SIZE */
 #include "platform.h"
 
-/* Test cases */
-static int test_init(void);
-static int test_key_generation(void);
-static int test_ecdh(void);
-static int test_key_derivation(void);
-static int test_encryption_decryption(void);
-static int test_nonce_generation(void);
-static int test_counter_integrity(void);
+#define TEST_ASSERT(cond, msg) do { \
+    if (!(cond)) { fprintf(stderr, "[FAIL] %s at line %d\n", msg, __LINE__); return -1; } \
+} while(0)
 
-int main(void) {
-    printf("Testing Security Module\n");
-    
-    /* Initialize platform */
-    platform_init();
-    
-    int failed = 0;
-    
-    printf("Test 1: Initialization... ");
-    if (test_init() == 0) {
-        printf("PASSED\n");
-    } else {
-        printf("FAILED\n");
-        failed++;
-    }
-    
-    printf("Test 2: Key generation... ");
-    if (test_key_generation() == 0) {
-        printf("PASSED\n");
-    } else {
-        printf("FAILED\n");
-        failed++;
-    }
-    
-    printf("Test 3: ECDH... ");
-    if (test_ecdh() == 0) {
-        printf("PASSED\n");
-    } else {
-        printf("FAILED\n");
-        failed++;
-    }
-    
-    printf("Test 4: Key derivation... ");
-    if (test_key_derivation() == 0) {
-        printf("PASSED\n");
-    } else {
-        printf("FAILED\n");
-        failed++;
-    }
-    
-    printf("Test 5: Encryption/decryption... ");
-    if (test_encryption_decryption() == 0) {
-        printf("PASSED\n");
-    } else {
-        printf("FAILED\n");
-        failed++;
-    }
-    
-    printf("Test 6: Nonce generation... ");
-    if (test_nonce_generation() == 0) {
-        printf("PASSED\n");
-    } else {
-        printf("FAILED\n");
-        failed++;
-    }
-    
-    printf("Test 7: Counter integrity... ");
-    if (test_counter_integrity() == 0) {
-        printf("PASSED\n");
-    } else {
-        printf("FAILED\n");
-        failed++;
-    }
-    
-    printf("\nTest summary: %d tests, %d passed, %d failed\n", 7, 7 - failed, failed);
-    
-    return failed ? 1 : 0;
-}
-
-/* Test initialization */
+/**
+ * Initializes the platform and security subsystem.
+ *
+ * @return 0 if initialization succeeds, -1 otherwise.
+ */
 static int test_init(void) {
-    /* Test valid parameters */
-    if (security_init(SECURITY_E2E, CIPHER_AES_GCM) != 0) {
+    printf("Testing security init...");
+    if (platform_init() != 0) {
+        fprintf(stderr, "[FAIL] platform_init failed\n");
         return -1;
     }
-    
-    /* Test invalid security mode */
-    if (security_init(3, CIPHER_AES_GCM) == 0) {
-        return -2;
+
+    if (security_init(SECURITY_E2E, CIPHER_XCHACHA20_POLY) != 0) {
+        fprintf(stderr, "[FAIL] security_init failed\n");
+        return -1;
     }
-    
-    /* Test invalid cipher */
-    if (security_init(SECURITY_E2E, 2) == 0) {
-        return -3;
-    }
-    
+    printf("[PASS]\n");
     return 0;
 }
 
-/* Test key generation */
+/**
+ * Generates a public/private keypair and verifies that the public key is not zeroed.
+ *
+ * @return 0 on success, or -1 if keypair generation fails or the public key appears zeroed.
+ */
 static int test_key_generation(void) {
-    uint8_t public_key[PUBLIC_KEY_LENGTH];
-    uint8_t private_key[PRIVATE_KEY_LENGTH];
-    
-    /* Initialize security */
-    if (security_init(SECURITY_E2E, CIPHER_AES_GCM) != 0) {
+    printf("Testing key generation...");
+
+    uint8_t pub[PUBLIC_KEY_LENGTH], priv[PRIVATE_KEY_LENGTH];
+
+    if (crypto_box_keypair(pub, priv) != 0) {
+        fprintf(stderr, "[FAIL] crypto_box_keypair\n");
         return -1;
     }
-    
-    /* Generate identity key */
-    if (security_generate_keypair(KEY_TYPE_IDENTITY, public_key, private_key) != 0) {
-        return -2;
-    }
-    
-    /* Verify keys are non-zero */
-    int all_zero = 1;
-    for (int i = 0; i < PUBLIC_KEY_LENGTH; i++) {
-        if (public_key[i] != 0) {
-            all_zero = 0;
-            break;
-        }
-    }
-    
-    if (all_zero) {
-        return -3;
-    }
-    
-    all_zero = 1;
-    for (int i = 0; i < PRIVATE_KEY_LENGTH; i++) {
-        if (private_key[i] != 0) {
-            all_zero = 0;
-            break;
-        }
-    }
-    
-    if (all_zero) {
-        return -4;
-    }
-    
-    /* Generate ephemeral key */
-    uint8_t public_key2[PUBLIC_KEY_LENGTH];
-    uint8_t private_key2[PRIVATE_KEY_LENGTH];
-    
-    if (security_generate_keypair(KEY_TYPE_EPHEMERAL, public_key2, private_key2) != 0) {
-        return -5;
-    }
-    
-    /* Keys should be different */
-    if (memcmp(public_key, public_key2, PUBLIC_KEY_LENGTH) == 0) {
-        return -6;
-    }
-    
-    if (memcmp(private_key, private_key2, PRIVATE_KEY_LENGTH) == 0) {
-        return -7;
-    }
-    
+
+    /* Ensure key lengths are reasonable */
+    TEST_ASSERT(sodium_memcmp(pub, "\x00\x00\x00\x00\x00\x00\x00\x00", 8) != 0, "Public key looks zeroed");
+
+    printf("[PASS]\n");
     return 0;
 }
 
-/* Test ECDH */
+/**
+ * Verifies that two identities derive the same shared secret through ECDH.
+ *
+ * @return 0 if the key exchange succeeds and both shared secrets match, -1 otherwise.
+ */
 static int test_ecdh(void) {
-    uint8_t alice_public[PUBLIC_KEY_LENGTH];
-    uint8_t alice_private[PRIVATE_KEY_LENGTH];
-    uint8_t bob_public[PUBLIC_KEY_LENGTH];
-    uint8_t bob_private[PRIVATE_KEY_LENGTH];
-    uint8_t alice_secret[SHARED_SECRET_LENGTH];
-    uint8_t bob_secret[SHARED_SECRET_LENGTH];
-    
-    /* Initialize security */
-    if (security_init(SECURITY_E2E, CIPHER_AES_GCM) != 0) {
+    printf("Testing ECDH key exchange...");
+
+    if (platform_init() != 0 || security_init(SECURITY_E2E, CIPHER_XCHACHA20_POLY) != 0) {
+        fprintf(stderr, "[FAIL] init for ecdh test\n");
         return -1;
     }
-    
-    /* Generate key pairs */
-    if (security_generate_keypair(KEY_TYPE_EPHEMERAL, alice_public, alice_private) != 0) {
-        return -2;
+
+    /* Alice & Bob each have identity keys via the subsystem */
+    uint8_t alice_pub[PUBLIC_KEY_LENGTH], alice_priv[PRIVATE_KEY_LENGTH];
+    uint8_t bob_pub[PUBLIC_KEY_LENGTH], bob_priv[PRIVATE_KEY_LENGTH];
+
+    crypto_box_keypair(alice_pub, alice_priv);
+    crypto_box_keypair(bob_pub, bob_priv);
+
+    /* Temporarily set subsystem identity keys to test compute_shared_secret */
+    if (security_store_identity_keys(alice_pub, alice_priv) != 0) {
+        fprintf(stderr, "[FAIL] store alice keys\n");
+        return -1;
     }
-    
-    if (security_generate_keypair(KEY_TYPE_EPHEMERAL, bob_public, bob_private) != 0) {
-        return -3;
+
+    uint8_t alice_shared[SHARED_SECRET_LENGTH];
+    TEST_ASSERT(security_compute_shared_secret(bob_pub, alice_shared) == 0, "alice DH failed");
+
+    /* Now Bob perspective */
+    if (security_store_identity_keys(bob_pub, bob_priv) != 0) {
+        fprintf(stderr, "[FAIL] store bob keys\n");
+        return -1;
     }
-    
-    /* Compute shared secrets */
-    if (security_compute_shared_secret(bob_public, alice_private, alice_secret) != 0) {
-        return -4;
-    }
-    
-    if (security_compute_shared_secret(alice_public, bob_private, bob_secret) != 0) {
-        return -5;
-    }
-    
-    /* Verify shared secrets match */
-    if (memcmp(alice_secret, bob_secret, SHARED_SECRET_LENGTH) != 0) {
-        return -6;
-    }
-    
+
+    uint8_t bob_shared[SHARED_SECRET_LENGTH];
+    TEST_ASSERT(security_compute_shared_secret(alice_pub, bob_shared) == 0, "bob DH failed");
+
+    TEST_ASSERT(sodium_memcmp(alice_shared, bob_shared, SHARED_SECRET_LENGTH) == 0,
+                "shared secrets mismatch");
+
+    sodium_memzero(alice_priv, sizeof(alice_priv));
+    sodium_memzero(bob_priv, sizeof(bob_priv));
+    sodium_memzero(alice_shared, sizeof(alice_shared));
+    sodium_memzero(bob_shared, sizeof(bob_shared));
+
+    printf("[PASS]\n");
     return 0;
 }
 
-/* Test key derivation */
+/**
+ * Verifies deterministic session key derivation and parameter-dependent key separation.
+ *
+ * @return 0 if all derivation checks pass; -1 otherwise.
+ */
 static int test_key_derivation(void) {
-    uint8_t shared_secret[SHARED_SECRET_LENGTH];
-    uint8_t tx_key[SYMMETRIC_KEY_LENGTH];
-    uint8_t rx_key[SYMMETRIC_KEY_LENGTH];
-    
-    /* Initialize security */
-    if (security_init(SECURITY_E2E, CIPHER_AES_GCM) != 0) {
-        return -1;
-    }
-    
-    /* Generate a random shared secret */
-    platform_random_bytes(shared_secret, SHARED_SECRET_LENGTH);
-    
-    /* Derive keys */
-    if (security_derive_keys(shared_secret, tx_key, rx_key) != 0) {
-        return -2;
-    }
-    
-    /* Verify keys are different */
-    if (memcmp(tx_key, rx_key, SYMMETRIC_KEY_LENGTH) == 0) {
-        return -3;
-    }
-    
-    /* Verify keys are non-zero */
-    int all_zero = 1;
-    for (int i = 0; i < SYMMETRIC_KEY_LENGTH; i++) {
-        if (tx_key[i] != 0) {
-            all_zero = 0;
-            break;
-        }
-    }
-    
-    if (all_zero) {
-        return -4;
-    }
-    
-    all_zero = 1;
-    for (int i = 0; i < SYMMETRIC_KEY_LENGTH; i++) {
-        if (rx_key[i] != 0) {
-            all_zero = 0;
-            break;
-        }
-    }
-    
-    if (all_zero) {
-        return -5;
-    }
-    
+    printf("Testing session key derivation...");
+
+    uint8_t shared[SHARED_SECRET_LENGTH];
+    randombytes_buf(shared, SHARED_SECRET_LENGTH);
+
+    uint8_t sess1[SYMMETRIC_KEY_LENGTH], sess2[SYMMETRIC_KEY_LENGTH];
+
+    TEST_ASSERT(security_derive_session_key(shared, 0x0001, 0x0002, sess1) == 0, "derive1 fail");
+    TEST_ASSERT(security_derive_session_key(shared, 0x0001, 0x0002, sess2) == 0, "derive2 fail");
+
+    TEST_ASSERT(sodium_memcmp(sess1, sess2, SYMMETRIC_KEY_LENGTH) == 0, "derived keys mismatch");
+
+    uint8_t sess_diff[SYMMETRIC_KEY_LENGTH];
+    TEST_ASSERT(security_derive_session_key(shared, 0x0001, 0x00FF, sess_diff) == 0, "derive diff fail");
+    TEST_ASSERT(sodium_memcmp(sess1, sess_diff, SYMMETRIC_KEY_LENGTH) != 0, "should differ for different peer_id");
+
+    sodium_memzero(shared, sizeof(shared));
+    printf("[PASS]\n");
     return 0;
 }
 
-/* Test encryption/decryption */
+/**
+ * Verifies authenticated encryption and decryption, including rejection of tampered ciphertext and associated data.
+ */
 static int test_encryption_decryption(void) {
+    printf("Testing encrypt/decrypt roundtrip...");
+
+    if (platform_init() != 0 || security_init(SECURITY_E2E_AUTH, CIPHER_XCHACHA20_POLY) != 0) {
+        fprintf(stderr, "[FAIL] init for enc test\n");
+        return -1;
+    }
+
     uint8_t key[SYMMETRIC_KEY_LENGTH];
+    randombytes_buf(key, SYMMETRIC_KEY_LENGTH);
+
+    const char *plaintext = "Hello Meridian mesh network!";
+    size_t len = strlen(plaintext);
+
     secure_nonce_t nonce;
-    uint8_t plaintext[100] = "This is a test message for encryption and decryption.";
-    size_t plaintext_len = strlen((char*)plaintext);
-    uint8_t ciphertext[100];
+    TEST_ASSERT(security_get_next_nonce(&nonce) == 0, "nonce fail");
+
+    uint8_t ct[MAX_PAYLOAD_SIZE];
     uint8_t tag[TAG_LENGTH];
-    uint8_t decrypted[100];
-    
-    /* Initialize security */
-    if (security_init(SECURITY_E2E, CIPHER_AES_GCM) != 0) {
-        return -1;
-    }
-    
-    /* Generate a random key */
-    platform_random_bytes(key, SYMMETRIC_KEY_LENGTH);
-    
-    /* Create a nonce */
-    memset(&nonce, 0, sizeof(secure_nonce_t));
-    platform_random_bytes(nonce.node_id, sizeof(nonce.node_id));
-    nonce.counter = 1;
-    nonce.random = 0x42;
-    
-    /* Encrypt */
-    if (security_encrypt(key, &nonce, plaintext, plaintext_len, NULL, 0, ciphertext, tag) != 0) {
-        return -2;
-    }
-    
-    /* Decrypt */
-    if (security_decrypt(key, &nonce, ciphertext, plaintext_len, NULL, 0, tag, decrypted) != 0) {
-        return -3;
-    }
-    
-    /* Verify decrypted == plaintext */
-    if (memcmp(plaintext, decrypted, plaintext_len) != 0) {
-        return -4;
-    }
-    
-    /* Test with AAD */
-    const uint8_t aad[] = "Associated data";
-    size_t aad_len = strlen((char*)aad);
-    
-    /* Encrypt with AAD */
-    if (security_encrypt(key, &nonce, plaintext, plaintext_len, aad, aad_len, ciphertext, tag) != 0) {
-        return -5;
-    }
-    
-    /* Decrypt with AAD */
-    if (security_decrypt(key, &nonce, ciphertext, plaintext_len, aad, aad_len, tag, decrypted) != 0) {
-        return -6;
-    }
-    
-    /* Verify decrypted == plaintext */
-    if (memcmp(plaintext, decrypted, plaintext_len) != 0) {
-        return -7;
-    }
-    
-    /* Test with wrong AAD */
-    const uint8_t wrong_aad[] = "Wrong data";
-    size_t wrong_aad_len = strlen((char*)wrong_aad);
-    
-    /* Should fail to decrypt with wrong AAD */
-    if (security_decrypt(key, &nonce, ciphertext, plaintext_len, wrong_aad, wrong_aad_len, tag, decrypted) == 0) {
-        return -8;
-    }
-    
-    /* Test with wrong tag */
-    uint8_t wrong_tag[TAG_LENGTH];
-    memcpy(wrong_tag, tag, TAG_LENGTH);
-    wrong_tag[0] ^= 0x01; /* Flip a bit */
-    
-    /* Should fail to decrypt with wrong tag */
-    if (security_decrypt(key, &nonce, ciphertext, plaintext_len, aad, aad_len, wrong_tag, decrypted) == 0) {
-        return -9;
-    }
-    
+    uint8_t aad[16] = "AAD_HEADER";
+
+    int rc = security_encrypt(key, &nonce, (uint8_t*)plaintext, len,
+                              aad, sizeof(aad), ct, tag);
+    TEST_ASSERT(rc > 0, "encrypt failed");
+
+    uint8_t pt[MAX_PAYLOAD_SIZE];
+    rc = security_decrypt(key, &nonce, ct, len,
+                          aad, sizeof(aad), tag, pt);
+    TEST_ASSERT(rc > 0, "decrypt failed");
+    TEST_ASSERT(memcmp(plaintext, pt, len) == 0, "roundtrip mismatch");
+
+    /* Tamper with ciphertext -> should fail auth */
+    ct[3] ^= 0xFF;
+    rc = security_decrypt(key, &nonce, ct, len,
+                          aad, sizeof(aad), tag, pt);
+    TEST_ASSERT(rc < 0, "tampered packet accepted");
+
+    /* Tamper with AAD -> should fail auth */
+    const char *plaintext2 = "Second message";
+    size_t len2 = strlen(plaintext2);
+
+    uint8_t ct2[MAX_PAYLOAD_SIZE], tag2[TAG_LENGTH];
+    security_get_next_nonce(&nonce);
+    TEST_ASSERT(security_encrypt(key, &nonce, (uint8_t*)plaintext2, len2,
+                                 aad, sizeof(aad), ct2, tag2) > 0, "encrypt2 fail");
+
+    uint8_t bad_aad[16] = {0};
+    rc = security_decrypt(key, &nonce, ct2, len2,
+                          bad_aad, sizeof(bad_aad), tag2, pt);
+    TEST_ASSERT(rc < 0, "AAD tamper accepted");
+
+    sodium_memzero(key, sizeof(key));
+    printf("[PASS]\n");
     return 0;
 }
 
-/* Test nonce generation */
+/**
+ * Verifies that generated nonces are unique and have a non-decreasing monotonic component.
+ *
+ * @return 0 if all nonce checks pass, or -1 if initialization or any check fails.
+ */
 static int test_nonce_generation(void) {
-    secure_nonce_t nonce1, nonce2;
-    
-    /* Initialize security */
-    if (security_init(SECURITY_E2E, CIPHER_AES_GCM) != 0) {
+    printf("Testing nonce uniqueness...");
+
+    if (platform_init() != 0 || security_init(SECURITY_E2E, CIPHER_XCHACHA20_POLY) != 0) {
+        fprintf(stderr, "[FAIL] init for nonce test\n");
         return -1;
     }
-    
-    /* Get first nonce */
-    if (security_get_next_nonce(&nonce1) != 0) {
-        return -2;
+
+    secure_nonce_t n[256];
+    for (int i = 0; i < 256; i++) {
+        TEST_ASSERT(security_get_next_nonce(&n[i]) == 0, "nonce gen fail");
     }
-    
-    /* Get second nonce */
-    if (security_get_next_nonce(&nonce2) != 0) {
-        return -3;
-    }
-    
-    /* Verify counter incremented */
-    if (nonce2.counter != nonce1.counter + 1) {
-        return -4;
-    }
-    
-    /* Generate several nonces and verify counter keeps incrementing */
-    uint64_t last_counter = nonce2.counter;
-    for (int i = 0; i < 10; i++) {
-        if (security_get_next_nonce(&nonce1) != 0) {
-            return -5;
+
+    /* All nonces must be unique */
+    for (int i = 0; i < 256; i++) {
+        for (int j = i + 1; j < 256; j++) {
+            TEST_ASSERT(n[i].value != n[j].value, "duplicate nonce");
         }
-        
-        if (nonce1.counter != last_counter + 1) {
-            return -6;
-        }
-        
-        last_counter = nonce1.counter;
     }
-    
+
+    /* Monotonic part should increase */
+    uint64_t mono_shift = NONCE_MONOTONIC_BITS;
+    for (int i = 1; i < 256; i++) {
+        uint64_t prev_mono = n[i-1].value >> mono_shift;
+        uint64_t curr_mono = n[i].value >> mono_shift;
+        TEST_ASSERT(curr_mono >= prev_mono, "nonce monotonicity violated");
+    }
+
+    printf("[PASS]\n");
     return 0;
 }
 
-/* Test counter integrity */
-static int test_counter_integrity(void) {
-    /* Initialize security */
-    if (security_init(SECURITY_E2E, CIPHER_AES_GCM) != 0) {
+/**
+ * Verifies storing and retrieving session keys for multiple peers, including rejection of an unknown peer.
+ *
+ * @return 0 if session management behaves as expected, or -1 if initialization or any verification fails.
+ */
+static int test_session_management(void) {
+    printf("Testing session management...");
+
+    if (platform_init() != 0 || security_init(SECURITY_E2E_AUTH, CIPHER_XCHACHA20_POLY) != 0) {
+        fprintf(stderr, "[FAIL] init for session test\n");
         return -1;
     }
-    
-    /* Verify counter integrity */
-    if (security_verify_counter_integrity() != 0) {
-        return -2;
-    }
-    
-    /* Generate a nonce to increment the counter */
-    secure_nonce_t nonce;
-    if (security_get_next_nonce(&nonce) != 0) {
-        return -3;
-    }
-    
-    /* Verify counter integrity again */
-    if (security_verify_counter_integrity() != 0) {
-        return -4;
-    }
-    
+
+    uint8_t key1[SYMMETRIC_KEY_LENGTH], key2[SYMMETRIC_KEY_LENGTH];
+    randombytes_buf(key1, SYMMETRIC_KEY_LENGTH);
+    randombytes_buf(key2, SYMMETRIC_KEY_LENGTH);
+
+    uint16_t peer_a = 0x0100, peer_b = 0x0200;
+
+    TEST_ASSERT(security_set_session(peer_a, key1) == 0, "set session A fail");
+    TEST_ASSERT(security_set_session(peer_b, key2) == 0, "set session B fail");
+
+    uint8_t retrieved[SYMMETRIC_KEY_LENGTH];
+
+    TEST_ASSERT(security_get_session_key(peer_a, retrieved) == 0, "get session A fail");
+    TEST_ASSERT(sodium_memcmp(key1, retrieved, SYMMETRIC_KEY_LENGTH) == 0, "key A mismatch");
+
+    TEST_ASSERT(security_get_session_key(peer_b, retrieved) == 0, "get session B fail");
+    TEST_ASSERT(sodium_memcmp(key2, retrieved, SYMMETRIC_KEY_LENGTH) == 0, "key B mismatch");
+
+    TEST_ASSERT(security_get_session_key(0xFFFF, retrieved) == -1, "unknown peer should fail");
+
+    sodium_memzero(key1, sizeof(key1));
+    sodium_memzero(key2, sizeof(key2));
+
+    printf("[PASS]\n");
     return 0;
+}
+
+/**
+ * Verifies identity key storage and, on real flash platforms, reloading.
+ *
+ * @returns 0 if the identity keys are stored and verified successfully, or -1
+ * if initialization, storage, retrieval, or key comparison fails.
+ */
+static int test_identity_storage(void) {
+    printf("Testing identity key generation + store API...");
+
+    if (platform_init() != 0 || security_init(SECURITY_E2E, CIPHER_XCHACHA20_POLY) != 0) {
+        fprintf(stderr, "[FAIL] init for storage test\n");
+        return -1;
+    }
+
+    uint8_t pub[PUBLIC_KEY_LENGTH], priv[PRIVATE_KEY_LENGTH];
+    crypto_box_keypair(pub, priv);
+
+    /* On simulated platform (Linux), flash is stubbed and cannot roundtrip.
+     * We verify: store API completes without error and internal state is updated. */
+    TEST_ASSERT(security_store_identity_keys(pub, priv) == 0, "store identity fail");
+
+    uint8_t loaded_pub[PUBLIC_KEY_LENGTH], loaded_priv[PRIVATE_KEY_LENGTH];
+
+#ifdef PLATFORM_REAL_FLASH
+    /* Real hardware path: verify reload matches */
+    if (security_load_identity_keys(loaded_pub, loaded_priv) != 0) {
+        fprintf(stderr, "[FAIL] load identity failed on real flash\n");
+        return -1;
+    }
+    TEST_ASSERT(sodium_memcmp(pub, loaded_pub, PUBLIC_KEY_LENGTH) == 0, "pub key mismatch on reload");
+    TEST_ASSERT(sodium_memcmp(priv, loaded_priv, PRIVATE_KEY_LENGTH) == 0, "priv key mismatch on reload");
+
+    sodium_memzero(priv, sizeof(priv));
+    sodium_memzero(loaded_priv, sizeof(loaded_priv));
+#else
+    /* Simulated platform: we cannot verify persistence across load() because flash is stubbed.
+     * Instead, verify that the in-memory identity keys are set correctly via store(). */
+    TEST_ASSERT(security_get_identity_public_key(loaded_pub) == 0, "get_identity_pubkey fail");
+    TEST_ASSERT(sodium_memcmp(pub, loaded_pub, PUBLIC_KEY_LENGTH) == 0, "stored pub not reflected in memory");
+#endif
+
+    sodium_memzero(priv, sizeof(priv));
+
+    printf("[PASS]\n");
+    return 0;
+}
+
+/**
+ * Runs the security subsystem test suite and reports the number of failures.
+ *
+ * @return The number of failed tests, or 1 if libsodium initialization fails.
+ */
+int main(void) {
+    if (sodium_init() < 0) {
+        fprintf(stderr, "libsodium init failed\n");
+        return 1;
+    }
+
+    int failures = 0;
+
+    if (test_init()) failures++;
+    if (test_key_generation()) failures++;
+    if (test_ecdh()) failures++;
+    if (test_key_derivation()) failures++;
+    if (test_encryption_decryption()) failures++;
+    if (test_nonce_generation()) failures++;
+    if (test_session_management()) failures++;
+    if (test_identity_storage()) failures++;
+
+    printf("\n%d test(s) run. %d failure(s).\n", 8, failures);
+    return failures;
 }

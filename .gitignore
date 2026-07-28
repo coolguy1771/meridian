@@ -276,3 +276,4 @@ CMakeUserPresets.json
 
 # External projects
 *-prefix/
+build/

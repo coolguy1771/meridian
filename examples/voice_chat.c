@@ -1,246 +1,169 @@
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <signal.h>
-#include <unistd.h>
-
-#include "radio_config.h"
+#include "platform.h"
 #include "security.h"
 #include "packet.h"
-#include "audio.h"
-#include "radio.h"
-#include "mesh.h"
 
-/* Global state */
-static volatile int running = 1;
-static uint16_t node_id = 0;
-static uint16_t target_node = BROADCAST_ADDR;
-static uint8_t ptt_state = PTT_RELEASED;
+/* Example: Voice chat over Meridian mesh using Codec2-style payload packaging.
+ * This example focuses on the crypto/security plumbing; actual Codec2 encode/decode
+ * would be integrated in a production build with -DUSE_CODEC2=ON. */
 
-/* Function prototypes */
-static void signal_handler(int sig);
-static void radio_rx_callback(uint8_t* buffer, size_t size, int16_t rssi, int8_t snr);
-static void radio_tx_callback(void);
-static void print_help(void);
+#define OUR_NODE_ID   0x1001
+#define PEER_NODE_ID  0x1002
 
-int main(int argc, char *argv[]) {
-    /* Parse command line arguments */
-    uint8_t region = REGION_AMERICAS;
-    uint8_t terrain = TERRAIN_MIXED;
-    uint8_t security_mode = SECURITY_E2E_AUTH;
-    uint8_t codec_mode = CODEC2_MODE_1600;
-    
-    int opt;
-    while ((opt = getopt(argc, argv, "i:t:r:e:s:c:h")) != -1) {
-        switch (opt) {
-            case 'i':
-                node_id = (uint16_t)strtol(optarg, NULL, 0);
-                break;
-            case 't':
-                target_node = (uint16_t)strtol(optarg, NULL, 0);
-                break;
-            case 'r':
-                region = (uint8_t)strtol(optarg, NULL, 0);
-                break;
-            case 'e':
-                terrain = (uint8_t)strtol(optarg, NULL, 0);
-                break;
-            case 's':
-                security_mode = (uint8_t)strtol(optarg, NULL, 0);
-                break;
-            case 'c':
-                codec_mode = (uint8_t)strtol(optarg, NULL, 0);
-                break;
-            case 'h':
-                print_help();
-                return 0;
-            default:
-                fprintf(stderr, "Unknown option: %c\n", opt);
-                print_help();
-                return 1;
-        }
-    }
-    
-    /* Check required parameters */
-    if (node_id == 0) {
-        fprintf(stderr, "Error: Node ID must be specified\n");
-        print_help();
+/**
+ * Demonstrates an encrypted voice packet exchange between two simulated nodes.
+ *
+ * @return 0 if the demonstration completes successfully, or 1 if initialization,
+ *         handshake, session-key, packet, serialization, or decryption processing fails.
+ */
+int main(void) {
+    printf("Meridian Voice Chat Demo (Codec2 stub + security)\n");
+
+    if (platform_init() != 0 || security_init(SECURITY_E2E_AUTH, CIPHER_XCHACHA20_POLY) != 0) {
+        fprintf(stderr, "Init failed\n");
         return 1;
     }
-    
-    printf("Adaptive Radio Voice Chat\n");
-    printf("Node ID: 0x%04X\n", node_id);
-    printf("Target: %s\n", target_node == BROADCAST_ADDR ? "Broadcast" : "Node");
-    
-    /* Initialize subsystems */
-    if (radio_config_init(region, terrain) != 0) {
-        fprintf(stderr, "Failed to initialize radio configuration\n");
+
+    packet_init(OUR_NODE_ID);
+
+    /* Create a sample voice payload stub (in production this would be Codec2 frames) */
+    uint8_t voice_frame[128];
+    memset(voice_frame, 0x42, sizeof(voice_frame)); /* Dummy data */
+
+    /* Establish session with peer via handshake simulation */
+    uint8_t eph_pub[PUBLIC_KEY_LENGTH], eph_priv[PRIVATE_KEY_LENGTH];
+    crypto_box_keypair(eph_pub, eph_priv);
+
+    uint8_t peer_pub[PUBLIC_KEY_LENGTH], peer_priv[PRIVATE_KEY_LENGTH];
+    crypto_box_keypair(peer_pub, peer_priv);
+
+    /* Store our identity keys */
+    security_store_identity_keys(eph_pub, eph_priv);
+
+    handshake_message_t hello;
+    memset(&hello, 0, sizeof(hello));
+    hello.type = HANDSHAKE_TYPE_HELLO;
+    hello.initiator_id = OUR_NODE_ID;
+    hello.responder_id = PEER_NODE_ID;
+    memcpy(hello.public_key, eph_pub, PUBLIC_KEY_LENGTH);
+
+    /* Simulate responder processing HELLO */
+    security_store_identity_keys(peer_pub, peer_priv);
+    handshake_message_t response;
+    int rc = security_process_handshake(&hello, PEER_NODE_ID, &response);
+    if (rc != 0 || response.type != HANDSHAKE_TYPE_RESPONSE) {
+        fprintf(stderr, "Handshake failed\n");
         return 1;
     }
-    
-    if (security_init(security_mode, CIPHER_AES_GCM) != 0) {
-        fprintf(stderr, "Failed to initialize security\n");
+
+    /* Confirm on initiator side */
+    uint8_t resp_eph[PUBLIC_KEY_LENGTH], resp_eph_priv[PRIVATE_KEY_LENGTH];
+    crypto_box_keypair(resp_eph, resp_eph_priv);
+    memcpy(response.public_key, resp_eph, PUBLIC_KEY_LENGTH);
+
+    security_store_identity_keys(eph_pub, eph_priv);
+    handshake_message_t confirm;
+    rc = security_process_handshake(&response, OUR_NODE_ID, &confirm);
+    if (rc != 0 || confirm.type != HANDSHAKE_TYPE_CONFIRM) {
+        fprintf(stderr, "Handshake confirm failed\n");
         return 1;
     }
-    
-    if (packet_init(node_id) != 0) {
-        fprintf(stderr, "Failed to initialize packet handling\n");
+
+    printf("Voice session established with node %04X\n", PEER_NODE_ID);
+
+    /* Now send encrypted voice frames */
+    uint8_t frame_key[SYMMETRIC_KEY_LENGTH];
+    rc = security_get_session_key(PEER_NODE_ID, frame_key);
+    if (rc != 0) {
+        fprintf(stderr, "No session key available\n");
         return 1;
     }
-    
-    if (audio_init(codec_mode) != 0) {
-        fprintf(stderr, "Failed to initialize audio\n");
+
+    packet_t pkt;
+    if (packet_create(&pkt, PEER_NODE_ID, PACKET_TYPE_VOICE,
+                      voice_frame, sizeof(voice_frame)) != 0) {
+        /* Cleanup on failure */
+        sodium_memzero(eph_priv, sizeof(eph_priv));
+        sodium_memzero(peer_priv, sizeof(peer_priv));
+        sodium_memzero(resp_eph_priv, sizeof(resp_eph_priv));
+        fprintf(stderr, "Voice packet creation failed\n");
         return 1;
     }
-    
-    if (mesh_init(node_id) != 0) {
-        fprintf(stderr, "Failed to initialize mesh networking\n");
+
+    if (packet_encrypt(&pkt, frame_key) != 0) {
+        sodium_memzero(frame_key, sizeof(frame_key));
+        sodium_memzero(eph_priv, sizeof(eph_priv));
+        sodium_memzero(peer_priv, sizeof(peer_priv));
+        sodium_memzero(resp_eph_priv, sizeof(resp_eph_priv));
+        fprintf(stderr, "Voice packet encryption failed\n");
         return 1;
     }
-    
-    /* Get optimal radio configuration */
-    radio_config_t config;
-    if (radio_config_get_optimal(&config) != 0) {
-        fprintf(stderr, "Failed to get optimal radio configuration\n");
+
+    uint8_t wire_buf[MAX_PACKET_SIZE];
+    int len = packet_serialize(&pkt, wire_buf, sizeof(wire_buf));
+    if (len <= 0) {
+        sodium_memzero(frame_key, sizeof(frame_key));
+        sodium_memzero(eph_priv, sizeof(eph_priv));
+        sodium_memzero(peer_priv, sizeof(peer_priv));
+        sodium_memzero(resp_eph_priv, sizeof(resp_eph_priv));
+        fprintf(stderr, "Serialization failed\n");
         return 1;
     }
-    
-    /* Initialize radio with optimal configuration */
-    if (radio_init(&config) != 0) {
-        fprintf(stderr, "Failed to initialize radio\n");
+
+    printf("Voice frame encrypted and serialized: %d bytes on wire\n", len);
+
+    /* Simulate decryption by the peer */
+    uint8_t peer_key[SYMMETRIC_KEY_LENGTH];
+    memset(peer_key, 0, sizeof(peer_key)); /* Ensure initialized before possible early use. */
+    security_store_identity_keys(peer_pub, peer_priv);
+
+    /* Re-derive session key from same handshake params */
+    uint8_t shared[SHARED_SECRET_LENGTH];
+    if (security_compute_shared_secret(eph_pub, shared) != 0) {
+        sodium_memzero(frame_key, sizeof(frame_key));
+        sodium_memzero(peer_key, sizeof(peer_key));
+        sodium_memzero(eph_priv, sizeof(eph_priv));
+        sodium_memzero(peer_priv, sizeof(peer_priv));
+        sodium_memzero(resp_eph_priv, sizeof(resp_eph_priv));
+        fprintf(stderr, "Failed to recompute shared secret for peer\n");
         return 1;
     }
-    
-    /* Set up radio callbacks */
-    radio_set_rx_callback(radio_rx_callback);
-    radio_set_tx_callback(radio_tx_callback);
-    
-    /* Set up signal handler for clean shutdown */
-    signal(SIGINT, signal_handler);
-    
-    /* Start in receive mode */
-    radio_set_rx(0); /* Continuous receive */
-    audio_start_playback();
-    
-    printf("Radio initialized on band %d, frequency %d MHz\n", 
-           config.band, config.frequency / 1000000);
-    printf("Press Ctrl+C to exit\n");
-    printf("Press 'p' for PTT, 'r' to release\n");
-    
-    /* Main loop */
-    char cmd;
-    while (running) {
-        /* Read a command from stdin (non-blocking) */
-        fd_set read_fds;
-        FD_ZERO(&read_fds);
-        FD_SET(STDIN_FILENO, &read_fds);
-        
-        struct timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = 100000; /* 100ms timeout */
-        
-        if (select(STDIN_FILENO + 1, &read_fds, NULL, NULL, &tv) > 0) {
-            if (read(STDIN_FILENO, &cmd, 1) > 0) {
-                if (cmd == 'p' && ptt_state == PTT_RELEASED) {
-                    /* Press PTT */
-                    ptt_state = PTT_PRESSED;
-                    printf("PTT pressed - transmitting\n");
-                    audio_process_ptt(ptt_state);
-                } else if (cmd == 'r' && ptt_state == PTT_PRESSED) {
-                    /* Release PTT */
-                    ptt_state = PTT_RELEASED;
-                    printf("PTT released - receiving\n");
-                    audio_process_ptt(ptt_state);
-                } else if (cmd == 'q') {
-                    /* Quit */
-                    running = 0;
-                }
-            }
-        }
-        
-        /* Periodic tasks */
-        /* Update environmental measurements (in a real system) */
-        /* Send beacon periodically */
-        /* etc. */
-        
-        usleep(10000); /* 10ms */
+
+    security_derive_session_key(shared, PEER_NODE_ID, OUR_NODE_ID, peer_key);
+    sodium_memzero(shared, sizeof(shared));
+
+    packet_t recv_pkt;
+    if (packet_deserialize(wire_buf, len, &recv_pkt) != 0) {
+        sodium_memzero(frame_key, sizeof(frame_key));
+        sodium_memzero(peer_key, sizeof(peer_key));
+        sodium_memzero(eph_priv, sizeof(eph_priv));
+        sodium_memzero(peer_priv, sizeof(peer_priv));
+        sodium_memzero(resp_eph_priv, sizeof(resp_eph_priv));
+        fprintf(stderr, "Deserialization failed\n");
+        return 1;
     }
-    
+
+    if (packet_decrypt(&recv_pkt, peer_key) != 0) {
+        sodium_memzero(frame_key, sizeof(frame_key));
+        sodium_memzero(peer_key, sizeof(peer_key));
+        sodium_memzero(eph_priv, sizeof(eph_priv));
+        sodium_memzero(peer_priv, sizeof(peer_priv));
+        sodium_memzero(resp_eph_priv, sizeof(resp_eph_priv));
+        fprintf(stderr, "Voice decryption failed\n");
+        return 1;
+    }
+
+    printf("Decrypted voice frame: %zu bytes (payload[0]=0x%02X)\n",
+           recv_pkt.payload_len, recv_pkt.payload[0]);
+
     /* Cleanup */
-    printf("Shutting down...\n");
-    radio_set_idle();
-    
+    sodium_memzero(frame_key, sizeof(frame_key));
+    sodium_memzero(peer_key, sizeof(peer_key));
+    sodium_memzero(eph_priv, sizeof(eph_priv));
+    sodium_memzero(peer_priv, sizeof(peer_priv));
+    sodium_memzero(resp_eph_priv, sizeof(resp_eph_priv));
+
+    printf("Voice chat demo completed successfully.\n");
     return 0;
-}
-
-/* Signal handler for Ctrl+C */
-static void signal_handler(int sig) {
-    running = 0;
-}
-
-/* Callback for received packets */
-static void radio_rx_callback(uint8_t* buffer, size_t size, int16_t rssi, int8_t snr) {
-    printf("Received packet: %zu bytes, RSSI: %d dBm, SNR: %d dB\n", size, rssi, snr);
-    
-    /* Parse the packet */
-    packet_t packet;
-    if (packet_deserialize(buffer, size, &packet) != 0) {
-        printf("Failed to parse packet\n");
-        return;
-    }
-    
-    /* Process through mesh logic */
-    int result = mesh_process_packet(&packet, rssi, snr);
-    
-    /* If it's a voice packet for us, queue it for playback */
-    if ((result == 0 || result == 2) && packet.header.type == PACKET_TYPE_VOICE) {
-        /* In a real implementation, we would decrypt the packet here */
-        printf("Voice packet from node 0x%04X\n", packet.header.source);
-        
-        /* Queue for playback */
-        audio_queue_for_playback(packet.payload, packet.payload_len);
-    }
-}
-
-/* Callback for completed transmissions */
-static void radio_tx_callback(void) {
-    printf("Transmission complete\n");
-    
-    /* If PTT is released, go back to receive mode */
-    if (ptt_state == PTT_RELEASED) {
-        radio_set_rx(0);
-    }
-}
-
-/* Print help information */
-static void print_help(void) {
-    printf("Usage: voice_chat -i <node_id> [options]\n");
-    printf("Options:\n");
-    printf("  -i <id>     Set node ID (required, hexadecimal)\n");
-    printf("  -t <id>     Set target node ID (default: broadcast)\n");
-    printf("  -r <region> Set regulatory region (0-3)\n");
-    printf("  -e <terrain> Set terrain type (0-3)\n");
-    printf("  -s <mode>   Set security mode (0-2)\n");
-    printf("  -c <mode>   Set codec mode (0-4)\n");
-    printf("  -h          Show this help\n");
-    printf("\nRegions:\n");
-    printf("  0: Americas (915 MHz)\n");
-    printf("  1: Europe (868 MHz)\n");
-    printf("  2: Asia\n");
-    printf("  3: Global\n");
-    printf("\nTerrain types:\n");
-    printf("  0: Urban\n");
-    printf("  1: Open field/desert\n");
-    printf("  2: Forest/dense vegetation\n");
-    printf("  3: Mixed terrain\n");
-    printf("\nSecurity modes:\n");
-    printf("  0: None (testing only)\n");
-    printf("  1: End-to-end encryption\n");
-    printf("  2: End-to-end with authentication\n");
-    printf("\nCodec modes:\n");
-    printf("  0: 3200 bits/s\n");
-    printf("  1: 2400 bits/s\n");
-    printf("  2: 1600 bits/s\n");
-    printf("  3: 1300 bits/s\n");
-    printf("  4: 700 bits/s\n");
 }
