@@ -104,8 +104,8 @@ static int test_create_packet(void) {
         return -5;
     }
     
-    if (packet.header.ttl != 5) {
-        return -6; /* Default TTL for unicast should be 5 */
+    if (packet.header.ttl != MAX_TTL) {
+        return -6; /* Default TTL for unicast is MAX_TTL */
     }
     
     /* Verify payload */

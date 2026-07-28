@@ -14,7 +14,7 @@
 #define MAX_ROUTE_ENTRIES 32
 
 /* Maximum time to keep a route entry (in milliseconds) */
-#define ROUTE_TIMEOUT_MS 300000 /* 5 minutes */
+#define ROUTE_TIMEOUT_MS 600000 /* 10 minutes, overridden in mesh.c if needed */
 
 /* Routing entry */
 typedef struct {
@@ -52,7 +52,7 @@ int mesh_init(uint16_t our_node_id);
  * @param snr Signal-to-noise ratio of received packet
  * @return 0 on success, negative on error
  */
-int mesh_process_packet(const packet_t* packet, int16_t rssi, int8_t snr);
+int mesh_process_packet(const packet_t* packet, uint16_t from_node, int16_t rssi, int8_t snr);
 
 /**
  * Send a packet through the mesh network
@@ -139,5 +139,29 @@ int mesh_prune_routes(void);
  * @return 0 on success, negative on error
  */
 int mesh_send_beacon(void);
+
+/* Group management API (leader-based provisioning) */
+
+/**
+ * Leader sends a GROUP_JOIN invitation to a specific member node for a group.
+ * If the group key does not exist yet on the leader, it is generated automatically.
+ *
+ * @param leader_id    Node ID of the group leader
+ * @param member_id    Node ID of the new member being invited
+ * @param group_id     Group ID to invite into
+ * @return 0 on success, negative on error
+ */
+int mesh_send_group_join_invite(uint16_t leader_id, uint16_t member_id, uint16_t group_id);
+
+/**
+ * Broadcast a group chat packet encrypted with the shared group key.
+ * Only nodes that are members of this group can decrypt it.
+ *
+ * @param group_id     Group ID for which to broadcast
+ * @param payload      Payload data
+ * @param len          Payload length in bytes
+ * @return 0 on success, negative on error
+ */
+int mesh_broadcast_group_chat(uint16_t group_id, const uint8_t* payload, size_t len);
 
 #endif /* MESH_H */

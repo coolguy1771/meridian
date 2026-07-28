@@ -1,105 +1,120 @@
 # MERIDIAN: Multiband Encrypted Radio for Independent Distance-Intensive Adaptive Networking
 
-MERIDIAN is an implementation of an adaptive multiband mesh radio system with advanced security architecture for secure long-range communications.
+Meridian is a secure, multiband LoRa mesh radio firmware designed as an alternative to Meshtastic. It implements end-to-end encryption using X25519 identity keys for pairwise session key derivation, XChaCha20-Poly1305 AEAD encryption of application payloads, and dynamic band selection across 433/868/915 MHz.
 
-## Features
+## Architecture Overview
 
-- **Multiband Operation**: Dynamically selects between multiple frequency bands (433 MHz, 868 MHz, 915 MHz) based on environmental conditions and regulatory requirements
-- **Mesh Networking**: Multi-hop communication to extend effective range
-- **Advanced Security**: End-to-end encryption with guarantees against nonce reuse and replay attacks
-- **Voice Communication**: Codec2 integration for efficient voice compression
-- **Regulatory Compliance**: Automatically adapts to regional frequency regulations
+### Hardware Targets
+- **MCU**: ESP32-C6 (recommended) or ESP32-S3
+  - RISC-V dual-core, 160 MHz, hardware crypto acceleration (AES, SHA, ECC/RSA)
+- **LoRa Radio**: SX1262 (or SX1280 for ultra-long-range variants)
+  - Integrated PA, sub-GHz multi-band operation, low power consumption
+- **Secure Element** (optional but recommended): ATECC608B/C or ESP32 built-in crypto module
+- **RTC**: DS3231 with separate power domain for timekeeping during sleep
+- **Audio**: Codec2-compatible ADC/DAC or external codec chip
 
-## Hardware Requirements
+### Security Model
+Meridian uses a layered security approach:
 
-- ESP32-S3 microcontroller
-- SX1262/SX1268 LoRa transceiver
-- ATECC608 secure cryptoprocessor
-- DS3231 RTC with separate power domain
-- Audio codec or ADC/DAC
-- Antenna system with band-specific matching networks
+1. **Identity Layer**: Each node has a long-term X25519 identity key pair stored in flash (encrypted with a device secret). Keys are HMAC-SHA256 integrity-protected and persist across reboots.
+
+2. **Key Exchange**: Nodes establish pairwise sessions via a static identity-based ECDH handshake:
+   - Initiator sends `HELLO` with its X25519 identity public key (broadcast)
+   - Responder derives shared secret via ECDH(responder_priv, initiator_pub), responds with its own identity public key in `RESPONSE`
+   - Both sides derive symmetric session keys using BLAKE2b-based KDF with node IDs as domain separation
+   - *Note: Current v1 uses static identity keys only (no ephemeral components). Long-term key compromise would allow decryption of historical traffic. Future versions may add ephemeral ECDH for forward secrecy.*
+
+3. **Packet Encryption**: All data packets use XChaCha20-Poly1305 AEAD (libsodium). Nonces are constructed from a persistent monotonic counter plus randomized low bits, preventing reuse under the same session key.
+
+4. **Replay Protection**: Sliding-window replay trackers per source node reject duplicate or out-of-order sequences within a configurable window (64 packets).
+
+5. **Band Security**: Beacons and handshakes use a network-level shared key; unicast traffic uses per-peer session keys derived from ECDH.
+
+### Protocol Overview
+- **Packet Types**: Voice, Handshake, ACK, Beacon, Control, Text, Position
+- **Mesh Routing**: Proactive distance-vector with RSSI-weighted route selection
+- **Band Selection**: Dynamic band switching based on noise floor measurements and link quality per neighbor
+- **Forwarding**: TTL-based multi-hop with seen-packet caching to prevent loops
 
 ## Directory Structure
 
-- `src/`: Source code for the radio implementation
-- `include/`: Header files
-- `lib/`: External libraries and dependencies
-- `docs/`: Documentation
-- `examples/`: Example applications
-- `tests/`: Unit tests
+```
+src/          Core firmware source
+include/      Public API headers
+examples/     Buildable example apps (Linux simulation)
+tests/        Unit tests for crypto/mesh layers
+docs/         Documentation
+cmake/        CMake helper modules
+```
 
 ## Dependencies
 
-The project has the following dependencies:
-- **libsodium** - Modern cryptographic library for security features (required)
-- **codec2** - Voice codec for efficient audio transmission (optional)
+- **Required**: libsodium (modern crypto library, provides XChaCha20-Poly1305, X25519, etc.)
+- **Optional**: codec2 (voice compression)
 
-### Installing Dependencies
-
-#### Debian/Ubuntu
+Install:
 ```bash
+# Debian/Ubuntu
 sudo apt-get install libsodium-dev libcodec2-dev
-```
 
-#### macOS
-```bash
+# Fedora
+sudo dnf install libsodium-devel codec2-devel
+
+# macOS
 brew install libsodium codec2
 ```
 
-#### Windows
-For Windows, you can download pre-built binaries from the respective project websites:
-- libsodium: https://libsodium.gitbook.io/doc/installation
-- codec2: https://github.com/drowe67/codec2
-
 ## Building
 
-### Using the build script
-
-The easiest way to build the project is to use the provided build script:
-
+### On Linux (simulation/testing mode)
 ```bash
-./build.sh
+mkdir -p build && cd build
+cmake .. -DBUILD_TESTS=ON
+make -j$(nproc)
 ```
 
-This script will:
-1. Create a build directory
-2. Run CMake with default options
-3. Build the project
-4. Run the tests
+This builds a host-targeted version where the platform layer is stubbed (GPIO/SPI/flash/radio operations simulate success). Useful for testing crypto logic, packet parsing, and handshake flows.
 
-### Manual build
+### On ESP32 (ESP-IDF build)
+Requires ESP-IDF v5.x+ with CMake toolchain configured. See `docs/getting_started.md` for the complete hardware build setup with ESP-IDF integration and SX126x driver configuration.
 
-If you prefer to build manually:
-
-1. Create build directory and navigate to it:
 ```bash
-mkdir -p build
+# With ESP-IDF environment loaded:
+cmake -G "Ninja" \
+  -DCMAKE_TOOLCHAIN_FILE=$IDF_PATH/tools/cmake/toolchain-esp32.cmake \
+  ..
+cmake --build .
+```
+
+## Usage (Simulation)
+
+```bash
 cd build
+
+# Run crypto/security tests
+./tests/test_security
+
+# Run packet layer tests  
+./tests/test_packet
+
+# Run mesh networking demo
+./examples/mesh_test
+
+# Run voice chat simulation
+./examples/voice_chat
 ```
 
-2. Configure with CMake:
-```bash
-cmake ..
-```
+## Comparison to Meshtastic
 
-3. Build the project:
-```bash
-make
-```
-
-### Build Options
-
-The following CMake options are available:
-- `BUILD_TESTS`: Build the test suite (ON by default)
-- `USE_HARDWARE_CRYPTO`: Use hardware cryptographic acceleration if available (ON by default)
-- `USE_CODEC2`: Enable voice codec support (OFF by default)
-- `LIBSODIUM_USE_STATIC_LIBS`: Use static libsodium library instead of shared (OFF by default)
-
-Example:
-```bash
-cmake .. -DUSE_CODEC2=ON -DLIBSODIUM_USE_STATIC_LIBS=ON
-```
+| Feature | Meridian | Meshtastic |
+|---------|----------|------------|
+| Cipher | XChaCha20-Poly1305 AEAD | AES-128-CCM |
+| Key Exchange | Ephemeral X25519 DH per pair | Pre-shared PSK |
+| Forward Secrecy | Yes (via ephemeral handshakes) | No (static key reuse) |
+| Replay Protection | Sliding-window per source | Basic sequence check |
+| Identity Model | Per-node X25519 keys | Shared channel keys |
+| Hardware Support | ESP32-C6 + SX1262 target | Many boards, mature firmware |
 
 ## License
 
-This project is released under the MIT License. See the LICENSE file for details.
+GNU General Public License v3.0 (GPL-3.0) — see LICENSE file for details.
