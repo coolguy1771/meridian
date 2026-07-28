@@ -471,7 +471,7 @@ int security_set_session(uint16_t peer_id, const uint8_t* session_key) {
     }
     if (idx < 0) {
         /* Table full: evict oldest entry by established_time */
-        int evict = 0;
+        int evict = 0; /* Always have a valid fallback: start with slot 0 */
         uint32_t oldest_time = sec_state.sessions[0].established_time;
         for (int i = 1; i < MAX_ACTIVE_SESSIONS; i++) {
             if (!sec_state.sessions[i].active ||
@@ -695,8 +695,10 @@ int security_set_group_key(uint16_t group_id, const uint8_t* key_in, uint16_t le
     }
 
     if (idx < 0) {
-        /* Group table full: evict oldest (highest epoch tiebreak not used for simplicity) */
+        /* Group table full: evict oldest group by epoch.
+         * Start with idx=0 so we always have a valid fallback index even when no entry is strictly older than slot 0's epoch. */
         uint32_t oldest_epoch = sec_state.groups[0].epoch + 1;
+        idx = 0;
         for (int i = 1; i < MAX_GROUP_KEYS; i++) {
             if (!sec_state.groups[i].active || sec_state.groups[i].epoch < oldest_epoch) {
                 oldest_epoch = sec_state.groups[i].epoch;

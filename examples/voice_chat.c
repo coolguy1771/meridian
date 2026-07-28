@@ -115,13 +115,23 @@ int main(void) {
 
     /* Simulate decryption by the peer */
     uint8_t peer_key[SYMMETRIC_KEY_LENGTH];
+    memset(peer_key, 0, sizeof(peer_key)); /* Ensure initialized before possible early use. */
     security_store_identity_keys(peer_pub, peer_priv);
 
     /* Re-derive session key from same handshake params */
     uint8_t shared[SHARED_SECRET_LENGTH];
-    if (security_compute_shared_secret(eph_pub, shared) == 0) {
-        security_derive_session_key(shared, PEER_NODE_ID, OUR_NODE_ID, peer_key);
+    if (security_compute_shared_secret(eph_pub, shared) != 0) {
+        sodium_memzero(frame_key, sizeof(frame_key));
+        sodium_memzero(peer_key, sizeof(peer_key));
+        sodium_memzero(eph_priv, sizeof(eph_priv));
+        sodium_memzero(peer_priv, sizeof(peer_priv));
+        sodium_memzero(resp_eph_priv, sizeof(resp_eph_priv));
+        fprintf(stderr, "Failed to recompute shared secret for peer\n");
+        return 1;
     }
+
+    security_derive_session_key(shared, PEER_NODE_ID, OUR_NODE_ID, peer_key);
+    sodium_memzero(shared, sizeof(shared));
 
     packet_t recv_pkt;
     if (packet_deserialize(wire_buf, len, &recv_pkt) != 0) {
